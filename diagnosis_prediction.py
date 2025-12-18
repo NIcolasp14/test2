@@ -1,0 +1,902 @@
+"""
+diagnosis_prediction.py
+
+Predict Diagnosis Presence from SDoH Features
+----------------------------------------------
+Creates balanced prediction tasks using combinations of diagnoses.
+NO temporal leakage - diagnoses are separate from features.
+
+Strategy:
+- Find patients in both full_acxiom.csv and diagnosis.csv
+- Create 10 random diagnosis combinations for balanced labels (~50% prevalence)
+- Run leakage-free CV on each combination
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re
+from collections import defaultdict
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import KNNImputer
+from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import (
+    classification_report, confusion_matrix, 
+    accuracy_score, roc_auc_score
+)
+import warnings
+warnings.filterwarnings('ignore')
+
+# Try importing optional models
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+    print("⚠️ LightGBM not available. Install with: pip install lightgbm")
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    print("⚠️ XGBoost not available. Install with: pip install xgboost")
+
+try:
+    from catboost import CatBoostClassifier
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
+    print("⚠️ CatBoost not available. Install with: pip install catboost")
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+ACXIOM_PATH = "full_acxiom.csv"
+DIAGNOSIS_PATH = "diagnosis.csv"
+OUTPUT_PATH = "diagnosis_prediction_results.csv"
+
+# Model parameters (aggressive regularization)
+RANDOM_STATE = 42
+N_CV_FOLDS = 5
+N_COMBINATIONS = 10  # Number of diagnosis combinations to test
+
+RF_PARAMS = {
+    'n_estimators': 50,
+    'max_depth': 4,
+    'min_samples_split': 20,
+    'min_samples_leaf': 10,
+    'max_features': 'sqrt',
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'class_weight': 'balanced',
+    'max_samples': 0.7
+}
+
+GB_PARAMS = {
+    'n_estimators': 50,
+    'max_depth': 3,
+    'learning_rate': 0.01,
+    'min_samples_split': 20,
+    'min_samples_leaf': 10,
+    'max_features': 'sqrt',
+    'random_state': RANDOM_STATE,
+    'subsample': 0.7
+}
+
+VARIANCE_THRESHOLD = 1e-5
+MISSING_THRESHOLD = 0.95
+
+
+# =============================================================================
+# Custom Transformers (NO DATA LEAKAGE)
+# =============================================================================
+
+class ColumnDropper(BaseEstimator, TransformerMixin):
+    """Remove columns with too many missing values or zero variance."""
+    def __init__(self, missing_threshold=0.95, variance_threshold=1e-5):
+        self.missing_threshold = missing_threshold
+        self.variance_threshold = variance_threshold
+        self.cols_to_keep_ = None
+        
+    def fit(self, X, y=None):
+        df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        
+        missing_frac = df.isna().mean()
+        variance = df.var()
+        
+        keep_missing = missing_frac <= self.missing_threshold
+        keep_variance = (variance > self.variance_threshold) | variance.isna()
+        
+        self.cols_to_keep_ = df.columns[keep_missing & keep_variance].tolist()
+        
+        if len(self.cols_to_keep_) == 0:
+            self.cols_to_keep_ = df.columns.tolist()[:10]
+        
+        return self
+    
+    def transform(self, X):
+        df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        return df[self.cols_to_keep_].values
+
+
+# =============================================================================
+# Step 1: Load and Link Datasets
+# =============================================================================
+
+def load_and_link_datasets(acxiom_path, diagnosis_path):
+    """
+    Load both datasets and find patients present in both.
+    
+    Returns:
+        acxiom_df, diagnosis_df, common_patient_ids
+    """
+    print("=" * 70)
+    print("Step 1: Loading and Linking Datasets")
+    print("=" * 70)
+    
+    # Load Acxiom (SDoH features)
+    print(f"\nLoading Acxiom data from {acxiom_path}...")
+    acxiom = pd.read_csv(acxiom_path, low_memory=False, dtype=str)
+    print(f"  Shape: {acxiom.shape}")
+    print(f"  Columns (first 10): {list(acxiom.columns[:10])}")
+    
+    # Load Diagnosis
+    print(f"\nLoading Diagnosis data from {diagnosis_path}...")
+    diagnosis = pd.read_csv(diagnosis_path, low_memory=False, dtype=str)
+    print(f"  Shape: {diagnosis.shape}")
+    print(f"  Columns (first 10): {list(diagnosis.columns[:10])}")
+    
+    # Find common ID column
+    possible_ids = ['sys_mbr_sk', 'clm_sys_mbr_sk', 'member_id', 'empi', 'lumeris_empi']
+    
+    acx_id_col = None
+    for col in possible_ids:
+        if col in acxiom.columns:
+            acx_id_col = col
+            break
+    
+    diag_id_col = None
+    for col in possible_ids:
+        if col in diagnosis.columns:
+            diag_id_col = col
+            break
+    
+    if not acx_id_col:
+        print(f"\n❌ No ID column found in Acxiom. Tried: {possible_ids}")
+        print(f"Available columns: {list(acxiom.columns[:20])}")
+        raise ValueError("Cannot find patient ID column in Acxiom")
+    
+    if not diag_id_col:
+        print(f"\n❌ No ID column found in Diagnosis. Tried: {possible_ids}")
+        print(f"Available columns: {list(diagnosis.columns[:20])}")
+        raise ValueError("Cannot find patient ID column in Diagnosis")
+    
+    print(f"\n✅ ID columns identified:")
+    print(f"   Acxiom: {acx_id_col}")
+    print(f"   Diagnosis: {diag_id_col}")
+    
+    # Normalize IDs
+    acxiom[acx_id_col] = acxiom[acx_id_col].astype(str).str.strip()
+    diagnosis[diag_id_col] = diagnosis[diag_id_col].astype(str).str.strip()
+    
+    # Find common patients
+    acx_ids = set(acxiom[acx_id_col].unique())
+    diag_ids = set(diagnosis[diag_id_col].unique())
+    common_ids = acx_ids.intersection(diag_ids)
+    
+    print(f"\n📊 Patient overlap:")
+    print(f"   Patients in Acxiom: {len(acx_ids):,}")
+    print(f"   Patients in Diagnosis: {len(diag_ids):,}")
+    print(f"   Patients in BOTH: {len(common_ids):,} ({len(common_ids)/len(acx_ids)*100:.1f}% of Acxiom)")
+    
+    if len(common_ids) < 50:
+        print(f"\n⚠️ WARNING: Only {len(common_ids)} common patients!")
+        print("   This may be too small for reliable analysis.")
+    
+    # Filter to common patients
+    acxiom_filtered = acxiom[acxiom[acx_id_col].isin(common_ids)].copy()
+    diagnosis_filtered = diagnosis[diagnosis[diag_id_col].isin(common_ids)].copy()
+    
+    # Rename ID columns to standard name
+    acxiom_filtered = acxiom_filtered.rename(columns={acx_id_col: 'patient_id'})
+    diagnosis_filtered = diagnosis_filtered.rename(columns={diag_id_col: 'patient_id'})
+    
+    return acxiom_filtered, diagnosis_filtered, list(common_ids)
+
+
+# =============================================================================
+# Step 2: Extract Diagnosis Information
+# =============================================================================
+
+def extract_diagnosis_codes(diagnosis_df):
+    """
+    Extract diagnosis codes and create patient-diagnosis matrix.
+    
+    Returns:
+        patient_diagnoses: dict {patient_id: set(diagnosis_codes)}
+        diagnosis_prevalence: Series with diagnosis counts
+    """
+    print("\n" + "=" * 70)
+    print("Step 2: Extracting Diagnosis Codes")
+    print("=" * 70)
+    
+    # Find diagnosis code column
+    diag_code_candidates = ['diagnosis_code', 'dx_code', 'diag_code', 'icd_code', 
+                           'icd10', 'icd9', 'dx', 'diagnosis', 'code']
+    
+    diag_col = None
+    for col in diag_code_candidates:
+        if col in diagnosis_df.columns:
+            diag_col = col
+            break
+    
+    # Case-insensitive search
+    if not diag_col:
+        cols_lower = {c.lower(): c for c in diagnosis_df.columns}
+        for cand in diag_code_candidates:
+            if cand.lower() in cols_lower:
+                diag_col = cols_lower[cand.lower()]
+                break
+    
+    if not diag_col:
+        print(f"\n❌ No diagnosis code column found. Tried: {diag_code_candidates}")
+        print(f"Available columns: {list(diagnosis_df.columns[:20])}")
+        raise ValueError("Cannot find diagnosis code column")
+    
+    print(f"\n✅ Diagnosis code column: {diag_col}")
+    
+    # Build patient → diagnoses mapping
+    patient_diagnoses = defaultdict(set)
+    for _, row in diagnosis_df.iterrows():
+        patient_id = row['patient_id']
+        diag_code = str(row[diag_col]).strip()
+        if diag_code and diag_code != 'nan':
+            patient_diagnoses[patient_id].add(diag_code)
+    
+    # Calculate prevalence
+    all_diagnoses = []
+    for diagnoses in patient_diagnoses.values():
+        all_diagnoses.extend(diagnoses)
+    
+    diagnosis_prevalence = pd.Series(all_diagnoses).value_counts()
+    
+    print(f"\n📊 Diagnosis statistics:")
+    print(f"   Patients with diagnoses: {len(patient_diagnoses):,}")
+    print(f"   Unique diagnosis codes: {len(diagnosis_prevalence):,}")
+    print(f"   Total diagnosis records: {len(all_diagnoses):,}")
+    print(f"   Avg diagnoses per patient: {len(all_diagnoses)/len(patient_diagnoses):.1f}")
+    
+    print(f"\n🔝 Top 20 diagnoses:")
+    for dx, count in diagnosis_prevalence.head(20).items():
+        pct = count / len(patient_diagnoses) * 100
+        print(f"   {dx}: {count} patients ({pct:.1f}%)")
+    
+    return dict(patient_diagnoses), diagnosis_prevalence
+
+
+# =============================================================================
+# Step 3: Create Balanced Diagnosis Combinations
+# =============================================================================
+
+def create_balanced_combinations(patient_diagnoses, diagnosis_prevalence, 
+                                n_combinations=10, target_prevalence=0.5, 
+                                min_prevalence=0.4, max_prevalence=0.6):
+    """
+    Create N random combinations of diagnoses that result in balanced labels.
+    
+    Args:
+        patient_diagnoses: dict {patient_id: set(diagnosis_codes)}
+        diagnosis_prevalence: Series with diagnosis counts
+        n_combinations: Number of combinations to create
+        target_prevalence: Target prevalence (0.5 = 50%)
+        min_prevalence: Minimum acceptable prevalence
+        max_prevalence: Maximum acceptable prevalence
+    
+    Returns:
+        List of diagnosis combinations (each is a set of diagnosis codes)
+    """
+    print("\n" + "=" * 70)
+    print("Step 3: Creating Balanced Diagnosis Combinations")
+    print("=" * 70)
+    
+    total_patients = len(patient_diagnoses)
+    target_count = int(total_patients * target_prevalence)
+    
+    print(f"\nTarget: {target_count} patients ({target_prevalence*100:.0f}%) per combination")
+    print(f"Acceptable range: {int(total_patients*min_prevalence)}-{int(total_patients*max_prevalence)} patients")
+    
+    # Filter to diagnoses with reasonable prevalence (5-40%)
+    min_patients = int(total_patients * 0.05)
+    max_patients = int(total_patients * 0.40)
+    
+    candidate_dx = diagnosis_prevalence[
+        (diagnosis_prevalence >= min_patients) & 
+        (diagnosis_prevalence <= max_patients)
+    ]
+    
+    print(f"\nCandidate diagnoses (5-40% prevalence): {len(candidate_dx)}")
+    
+    if len(candidate_dx) < 5:
+        print("⚠️ Too few candidate diagnoses, loosening criteria...")
+        candidate_dx = diagnosis_prevalence.head(50)
+    
+    combinations = []
+    attempts = 0
+    max_attempts = n_combinations * 100
+    
+    np.random.seed(RANDOM_STATE)
+    
+    while len(combinations) < n_combinations and attempts < max_attempts:
+        attempts += 1
+        
+        # Randomly select 2-6 diagnoses
+        n_dx = np.random.randint(2, 7)
+        selected_dx = set(np.random.choice(candidate_dx.index, size=min(n_dx, len(candidate_dx)), 
+                                          replace=False))
+        
+        # Count patients with ANY of these diagnoses
+        count = sum(1 for pt_dx in patient_diagnoses.values() 
+                   if len(pt_dx.intersection(selected_dx)) > 0)
+        
+        prevalence = count / total_patients
+        
+        # Check if prevalence is in acceptable range
+        if min_prevalence <= prevalence <= max_prevalence:
+            # Check this combination isn't too similar to existing ones
+            is_unique = True
+            for existing_combo in combinations:
+                overlap = len(selected_dx.intersection(existing_combo))
+                if overlap / len(selected_dx) > 0.7:  # >70% overlap
+                    is_unique = False
+                    break
+            
+            if is_unique:
+                combinations.append(selected_dx)
+                print(f"\n✓ Combination {len(combinations)}: {count} patients ({prevalence*100:.1f}%)")
+                print(f"  Diagnoses: {list(selected_dx)}")
+    
+    if len(combinations) < n_combinations:
+        print(f"\n⚠️ Only found {len(combinations)} combinations (wanted {n_combinations})")
+    
+    return combinations
+
+
+# =============================================================================
+# Step 4: Create Labels for Each Combination
+# =============================================================================
+
+def create_labels_for_combination(patient_ids, patient_diagnoses, diagnosis_combination):
+    """
+    Create binary labels: 1 if patient has ANY diagnosis from combination, 0 otherwise.
+    
+    Returns:
+        labels: Series with patient_id as index
+    """
+    labels = {}
+    for patient_id in patient_ids:
+        patient_dx = patient_diagnoses.get(patient_id, set())
+        has_diagnosis = len(patient_dx.intersection(diagnosis_combination)) > 0
+        labels[patient_id] = 1 if has_diagnosis else 0
+    
+    return pd.Series(labels)
+
+
+# =============================================================================
+# Step 5: Prepare Features (SDoH only, NO LEAKAGE)
+# =============================================================================
+
+def prepare_features(acxiom_df):
+    """
+    Extract SDoH features (NO diagnosis features to avoid leakage).
+    
+    Returns:
+        X_raw: DataFrame with raw features (with NaNs)
+        feature_names: List of feature names
+    """
+    print("\n" + "=" * 70)
+    print("Step 4: Preparing SDoH Features (NO LEAKAGE)")
+    print("=" * 70)
+    
+    # Identify SDoH columns (pattern: 2 letters + numbers, or ibe*)
+    pattern = re.compile(r'^[a-z]{2}\d+|^ibe\d+', re.IGNORECASE)
+    sdoh_cols = [col for col in acxiom_df.columns if pattern.match(col)]
+    
+    print(f"\n✅ Found {len(sdoh_cols)} SDoH columns")
+    print(f"   Examples: {sdoh_cols[:10]}")
+    
+    if len(sdoh_cols) == 0:
+        print("\n⚠️ No SDoH columns found, using all non-ID columns")
+        sdoh_cols = [col for col in acxiom_df.columns if col != 'patient_id']
+    
+    # Extract features - KEEP RAW with NaNs
+    X_raw = acxiom_df[sdoh_cols].copy()
+    
+    # Convert to numeric
+    for col in X_raw.columns:
+        X_raw[col] = pd.to_numeric(X_raw[col], errors='coerce')
+    
+    # Remove completely empty columns only
+    all_nan_cols = X_raw.columns[X_raw.isna().all()]
+    if len(all_nan_cols) > 0:
+        print(f"\n⚠️ Removing {len(all_nan_cols)} completely empty columns")
+        X_raw = X_raw.drop(columns=all_nan_cols)
+        sdoh_cols = [c for c in sdoh_cols if c not in all_nan_cols]
+    
+    # Report missingness
+    missing_pct = X_raw.isna().mean()
+    print(f"\n📊 Missingness statistics:")
+    print(f"   Average: {missing_pct.mean():.2%}")
+    print(f"   Features with >50% missing: {(missing_pct > 0.5).sum()}")
+    
+    print(f"\n✅ Prepared RAW feature matrix: {X_raw.shape}")
+    print("   (NaNs preserved for leakage-free CV)")
+    
+    return X_raw, sdoh_cols
+
+
+# =============================================================================
+# Step 6: Create Leakage-Free Model Pipelines
+# =============================================================================
+
+def create_model_pipelines():
+    """Create pipelines with all preprocessing inside."""
+    models = {}
+    
+    print("🔒 Creating leakage-free pipelines...")
+    print("   All preprocessing happens INSIDE cross-validation folds")
+    
+    models['Random Forest'] = Pipeline([
+        ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+        ('imputer', KNNImputer(n_neighbors=5)),
+        ('scaler', StandardScaler()),
+        ('model', RandomForestClassifier(**RF_PARAMS))
+    ])
+    
+    models['Gradient Boosting'] = Pipeline([
+        ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+        ('imputer', KNNImputer(n_neighbors=5)),
+        ('scaler', StandardScaler()),
+        ('model', GradientBoostingClassifier(**GB_PARAMS))
+    ])
+    
+    if LIGHTGBM_AVAILABLE:
+        lgbm_params = {
+            'n_estimators': 50, 'max_depth': 4, 'learning_rate': 0.01,
+            'num_leaves': 15, 'min_child_samples': 30, 'subsample': 0.7,
+            'colsample_bytree': 0.7, 'reg_alpha': 0.1, 'reg_lambda': 1.0,
+            'random_state': RANDOM_STATE, 'n_jobs': -1, 'verbosity': -1, 
+            'class_weight': 'balanced'
+        }
+        models['LightGBM'] = Pipeline([
+            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+            ('imputer', KNNImputer(n_neighbors=5)),
+            ('scaler', StandardScaler()),
+            ('model', lgb.LGBMClassifier(**lgbm_params))
+        ])
+    
+    if XGBOOST_AVAILABLE:
+        xgb_params = {
+            'n_estimators': 50, 'max_depth': 3, 'learning_rate': 0.01,
+            'min_child_weight': 10, 'subsample': 0.7, 'colsample_bytree': 0.7,
+            'gamma': 0.2, 'reg_alpha': 0.1, 'reg_lambda': 1.5,
+            'random_state': RANDOM_STATE, 'n_jobs': -1, 'eval_metric': 'logloss'
+        }
+        models['XGBoost'] = Pipeline([
+            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+            ('imputer', KNNImputer(n_neighbors=5)),
+            ('scaler', StandardScaler()),
+            ('model', xgb.XGBClassifier(**xgb_params))
+        ])
+    
+    if CATBOOST_AVAILABLE:
+        catboost_params = {
+            'iterations': 50, 'depth': 4, 'learning_rate': 0.01,
+            'l2_leaf_reg': 5, 'random_state': RANDOM_STATE,
+            'verbose': False, 'thread_count': -1,
+            'auto_class_weights': 'Balanced',
+            'min_data_in_leaf': 10, 'max_leaves': 16, 'subsample': 0.7
+        }
+        models['CatBoost'] = Pipeline([
+            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+            ('imputer', KNNImputer(n_neighbors=5)),
+            ('scaler', StandardScaler()),
+            ('model', CatBoostClassifier(**catboost_params))
+        ])
+    
+    print(f"✅ Created {len(models)} model pipelines")
+    
+    return models
+
+
+# =============================================================================
+# Step 7: Evaluate Each Combination
+# =============================================================================
+
+def evaluate_combination(X_raw, y, combination_name, models):
+    """
+    Run leakage-free CV for one diagnosis combination.
+    
+    Returns:
+        DataFrame with results for each model
+    """
+    skf = StratifiedKFold(n_splits=N_CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    
+    scoring = {
+        'accuracy': 'accuracy',
+        'precision': 'precision',
+        'recall': 'recall',
+        'f1': 'f1',
+        'roc_auc': 'roc_auc'
+    }
+    
+    results = []
+    
+    for model_name, pipeline in models.items():
+        try:
+            cv_results = cross_validate(
+                pipeline, X_raw, y,
+                cv=skf,
+                scoring=scoring,
+                n_jobs=1,
+                return_train_score=True,
+                error_score='raise'
+            )
+            
+            result = {
+                'Combination': combination_name,
+                'Model': model_name,
+                'Accuracy': cv_results['test_accuracy'].mean(),
+                'Accuracy_Std': cv_results['test_accuracy'].std(),
+                'Precision': cv_results['test_precision'].mean(),
+                'Recall': cv_results['test_recall'].mean(),
+                'F1': cv_results['test_f1'].mean(),
+                'ROC_AUC': cv_results['test_roc_auc'].mean(),
+                'Train_Acc': cv_results['train_accuracy'].mean(),
+                'Overfit_Gap': cv_results['train_accuracy'].mean() - cv_results['test_accuracy'].mean()
+            }
+            results.append(result)
+            
+        except Exception as e:
+            print(f"  ❌ {model_name} failed: {str(e)}")
+    
+    return pd.DataFrame(results)
+
+
+# =============================================================================
+# Step 8: Extract Feature Importances for Best Combination
+# =============================================================================
+
+def extract_feature_importances(X_raw, y, feature_names, best_model_pipeline):
+    """
+    Train best model on full data and extract feature importances.
+    
+    Returns:
+        DataFrame with feature importances sorted by importance
+    """
+    print("\n" + "=" * 70)
+    print("Extracting Feature Importances from Best Model")
+    print("=" * 70)
+    
+    # Fit the full pipeline on all data
+    best_model_pipeline.fit(X_raw, y)
+    
+    # Get the trained model from the pipeline
+    trained_model = best_model_pipeline.named_steps['model']
+    
+    # Get feature names after column dropping
+    dropper = best_model_pipeline.named_steps['dropper']
+    kept_features = dropper.cols_to_keep_
+    
+    # Extract feature importances if available
+    if hasattr(trained_model, 'feature_importances_'):
+        importances = trained_model.feature_importances_
+        
+        # Create DataFrame
+        importance_df = pd.DataFrame({
+            'feature': kept_features,
+            'importance': importances
+        }).sort_values('importance', ascending=False)
+        
+        print(f"\n✅ Extracted {len(importance_df)} feature importances")
+        print(f"\nTop 20 Most Important Features:")
+        print(importance_df.head(20).to_string(index=False))
+        
+        return importance_df
+    else:
+        print(f"\n⚠️ Model does not provide feature importances")
+        return None
+
+
+def plot_feature_importances(importance_df, top_n=20, filename='feature_importances.png'):
+    """
+    Plot top N feature importances.
+    """
+    if importance_df is None:
+        return
+    
+    print(f"\n📊 Creating feature importance plot...")
+    
+    top_features = importance_df.head(top_n)
+    
+    plt.figure(figsize=(10, 8))
+    plt.barh(range(len(top_features)), top_features['importance'], color='steelblue')
+    plt.yticks(range(len(top_features)), top_features['feature'])
+    plt.xlabel('Importance', fontsize=12)
+    plt.ylabel('Feature', fontsize=12)
+    plt.title(f'Top {top_n} Feature Importances for Diagnosis Prediction', 
+              fontsize=14, fontweight='bold')
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"✅ Saved: {filename}")
+    plt.show()
+
+
+def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correlation_heatmap.png'):
+    """
+    Plot correlation heatmap for top features.
+    """
+    if importance_df is None:
+        return
+    
+    print(f"\n📊 Creating correlation heatmap...")
+    
+    top_features = importance_df.head(top_n)['feature'].tolist()
+    
+    # Create DataFrame with top features and target
+    df_corr = X_raw[top_features].copy()
+    df_corr['diagnosis_label'] = y
+    
+    # Calculate correlation matrix
+    corr_matrix = df_corr.corr()
+    
+    # Plot heatmap
+    plt.figure(figsize=(14, 12))
+    sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm', 
+                center=0, square=True, linewidths=0.5, cbar_kws={"shrink": 0.8},
+                vmin=-1, vmax=1)
+    plt.title(f'Correlation Heatmap: Top {top_n} Features vs Diagnosis', 
+              fontsize=14, fontweight='bold', pad=20)
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"✅ Saved: {filename}")
+    plt.show()
+    
+    # Print correlations with target
+    print(f"\n📊 Correlations with Diagnosis Label:")
+    target_corr = corr_matrix['diagnosis_label'].drop('diagnosis_label').sort_values(ascending=False)
+    print(target_corr.to_string())
+
+
+def plot_model_comparison(final_results, filename='model_comparison.png'):
+    """
+    Plot comparison of model performance across all combinations.
+    """
+    print(f"\n📊 Creating model comparison plot...")
+    
+    # Average performance per model across all combinations
+    model_avg = final_results.groupby('Model').agg({
+        'F1': ['mean', 'std'],
+        'ROC_AUC': ['mean', 'std'],
+        'Overfit_Gap': ['mean', 'std']
+    }).reset_index()
+    
+    model_avg.columns = ['Model', 'F1_mean', 'F1_std', 'ROC_AUC_mean', 
+                         'ROC_AUC_std', 'Gap_mean', 'Gap_std']
+    model_avg = model_avg.sort_values('F1_mean', ascending=False)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot 1: F1-Score comparison
+    ax1 = axes[0]
+    models = model_avg['Model']
+    f1_means = model_avg['F1_mean']
+    f1_stds = model_avg['F1_std']
+    
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(models)))
+    bars = ax1.barh(range(len(models)), f1_means, xerr=f1_stds, 
+                     color=colors, capsize=5)
+    ax1.set_yticks(range(len(models)))
+    ax1.set_yticklabels(models)
+    ax1.set_xlabel('F1-Score', fontsize=12)
+    ax1.set_title('Model Comparison: F1-Score (Mean ± Std)', fontsize=13, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    
+    for i, (mean, std) in enumerate(zip(f1_means, f1_stds)):
+        ax1.text(mean + std + 0.01, i, f'{mean:.3f}', 
+                va='center', fontsize=10, fontweight='bold')
+    
+    # Plot 2: Overfitting analysis
+    ax2 = axes[1]
+    gaps = model_avg['Gap_mean']
+    colors2 = ['red' if gap > 0.1 else 'green' for gap in gaps]
+    
+    bars = ax2.barh(range(len(models)), gaps, color=colors2, alpha=0.7)
+    ax2.set_yticks(range(len(models)))
+    ax2.set_yticklabels(models)
+    ax2.set_xlabel('Overfit Gap (Train - Test)', fontsize=12)
+    ax2.set_title('Overfitting Analysis', fontsize=13, fontweight='bold')
+    ax2.axvline(x=0.1, color='orange', linestyle='--', linewidth=2, label='Warning threshold')
+    ax2.grid(axis='x', alpha=0.3)
+    ax2.legend()
+    ax2.invert_yaxis()
+    
+    for i, gap in enumerate(gaps):
+        ax2.text(gap + 0.005, i, f'{gap:.3f}', 
+                va='center', fontsize=10, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"✅ Saved: {filename}")
+    plt.show()
+
+
+    return pd.DataFrame(results)
+
+
+# =============================================================================
+# Main Execution
+# =============================================================================
+
+def main():
+    print("\n" + "=" * 70)
+    print("DIAGNOSIS PREDICTION FROM SDoH FEATURES")
+    print("Balanced, Leakage-Free Analysis")
+    print("=" * 70)
+    
+    # Step 1: Load and link datasets
+    acxiom_df, diagnosis_df, common_ids = load_and_link_datasets(ACXIOM_PATH, DIAGNOSIS_PATH)
+    
+    # Step 2: Extract diagnoses
+    patient_diagnoses, diagnosis_prevalence = extract_diagnosis_codes(diagnosis_df)
+    
+    # Step 3: Create balanced combinations
+    combinations = create_balanced_combinations(
+        patient_diagnoses, diagnosis_prevalence,
+        n_combinations=N_COMBINATIONS
+    )
+    
+    if len(combinations) == 0:
+        print("\n❌ No balanced combinations found!")
+        return
+    
+    # Step 4: Prepare features
+    X_raw, feature_names = prepare_features(acxiom_df)
+    
+    # Align X_raw with patient_diagnoses
+    X_raw['patient_id'] = acxiom_df['patient_id']
+    X_raw = X_raw.set_index('patient_id')
+    
+    # Step 5: Create models
+    print("\n" + "=" * 70)
+    print("Step 5: Creating Leakage-Free Model Pipelines")
+    print("=" * 70)
+    models = create_model_pipelines()
+    print(f"\n✅ Created {len(models)} model pipelines")
+    
+    # Step 6: Evaluate each combination
+    print("\n" + "=" * 70)
+    print(f"Step 6: Evaluating {len(combinations)} Diagnosis Combinations")
+    print("=" * 70)
+    
+    all_results = []
+    
+    for i, combination in enumerate(combinations, 1):
+        combo_name = f"Combo_{i}"
+        print(f"\n{'='*70}")
+        print(f"🔬 Testing Combination {i}/{len(combinations)}")
+        print(f"{'='*70}")
+        print(f"Diagnoses: {list(combination)}")
+        
+        # Create labels
+        y = create_labels_for_combination(X_raw.index, patient_diagnoses, combination)
+        y = y.reindex(X_raw.index, fill_value=0)
+        
+        print(f"\nLabel distribution:")
+        print(f"  Positive (has diagnosis): {(y==1).sum()} ({(y==1).mean()*100:.1f}%)")
+        print(f"  Negative (no diagnosis): {(y==0).sum()} ({(y==0).mean()*100:.1f}%)")
+        
+        # Evaluate
+        results_df = evaluate_combination(X_raw, y, combo_name, models)
+        all_results.append(results_df)
+        
+        # Print summary
+        if not results_df.empty:
+            best = results_df.sort_values('F1', ascending=False).iloc[0]
+            print(f"\n✅ Best model: {best['Model']}")
+            print(f"   F1: {best['F1']:.3f}, ROC-AUC: {best['ROC_AUC']:.3f}, Gap: {best['Overfit_Gap']:.3f}")
+    
+    # Combine all results
+    final_results = pd.concat(all_results, ignore_index=True)
+    
+    # Save results
+    final_results.to_csv(OUTPUT_PATH, index=False)
+    print(f"\n✅ Saved results to: {OUTPUT_PATH}")
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("SUMMARY: Best Results per Combination")
+    print("=" * 70)
+    
+    for combo in final_results['Combination'].unique():
+        combo_results = final_results[final_results['Combination'] == combo]
+        best = combo_results.sort_values('F1', ascending=False).iloc[0]
+        
+        print(f"\n{combo}:")
+        print(f"  Best Model: {best['Model']}")
+        print(f"  Accuracy: {best['Accuracy']:.3f} ± {best['Accuracy_Std']:.3f}")
+        print(f"  F1-Score: {best['F1']:.3f}")
+        print(f"  ROC-AUC: {best['ROC_AUC']:.3f}")
+        print(f"  Overfit Gap: {best['Overfit_Gap']:.3f}")
+        
+        if best['Overfit_Gap'] < 0.05:
+            print(f"  ✅ Excellent generalization")
+        elif best['Overfit_Gap'] < 0.10:
+            print(f"  ⚡ Good generalization")
+        else:
+            print(f"  ⚠️ Some overfitting")
+    
+    # Overall best
+    overall_best = final_results.sort_values('F1', ascending=False).iloc[0]
+    print(f"\n🏆 Overall Best Performance:")
+    print(f"   Combination: {overall_best['Combination']}")
+    print(f"   Model: {overall_best['Model']}")
+    print(f"   F1-Score: {overall_best['F1']:.3f}")
+    print(f"   ROC-AUC: {overall_best['ROC_AUC']:.3f}")
+    
+    # Step 7: Extract feature importances for best combination
+    print("\n" + "=" * 70)
+    print("Step 7: Feature Importance Analysis")
+    print("=" * 70)
+    
+    best_combo_idx = int(overall_best['Combination'].split('_')[1]) - 1
+    best_combo = combinations[best_combo_idx]
+    best_model_name = overall_best['Model']
+    
+    print(f"\nAnalyzing best combination: {overall_best['Combination']}")
+    print(f"Diagnoses: {list(best_combo)}")
+    print(f"Best model: {best_model_name}")
+    
+    # Create labels for best combination
+    y_best = create_labels_for_combination(X_raw.index, patient_diagnoses, best_combo)
+    y_best = y_best.reindex(X_raw.index, fill_value=0)
+    
+    # Get the best model pipeline
+    best_pipeline = models[best_model_name]
+    
+    # Extract feature importances
+    importance_df = extract_feature_importances(X_raw, y_best, X_raw.columns.tolist(), best_pipeline)
+    
+    # Visualizations
+    if importance_df is not None:
+        plot_feature_importances(importance_df, top_n=20)
+        plot_correlation_heatmap(X_raw, y_best, importance_df, top_n=20)
+    
+    # Model comparison plot
+    plot_model_comparison(final_results)
+    
+    print("\n" + "=" * 70)
+    print("✅ ANALYSIS COMPLETE")
+    print("=" * 70)
+    print(f"\n📁 Output Files:")
+    print(f"   - {OUTPUT_PATH}")
+    print(f"   - feature_importances.png")
+    print(f"   - correlation_heatmap.png")
+    print(f"   - model_comparison.png")
+    
+    print("\n" + "=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+
