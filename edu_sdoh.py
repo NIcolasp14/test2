@@ -20,8 +20,9 @@ import re
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_validate
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
+from sklearn.impute import KNNImputer
 from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import (
     classification_report, confusion_matrix, 
     accuracy_score, precision_recall_fscore_support,
@@ -142,6 +143,10 @@ CATBOOST_PARAMS = {
 
 # Analysis parameters
 TOP_N_FEATURES = 20
+
+# Preprocessing parameters (for custom transformers)
+VARIANCE_THRESHOLD = 1e-5  # Remove features with variance below this
+MISSING_THRESHOLD = 0.95   # Remove features with >95% missing
 
 
 # =============================================================================
@@ -403,50 +408,112 @@ def identify_sdoh_columns(df):
 
 
 # =============================================================================
-# Step 5: Prepare Data for Machine Learning
+# Custom Transformers (NO DATA LEAKAGE)
 # =============================================================================
 
-def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
+class ColumnDropper(BaseEstimator, TransformerMixin):
+    """
+    Remove columns with too many missing values or zero variance.
+    Fit on training data only to prevent leakage.
+    """
+    def __init__(self, missing_threshold=0.95, variance_threshold=1e-5):
+        self.missing_threshold = missing_threshold
+        self.variance_threshold = variance_threshold
+        self.cols_to_keep_ = None
+        
+    def fit(self, X, y=None):
+        df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        
+        # Identify columns to drop based on training data only
+        missing_frac = df.isna().mean()
+        variance = df.var()
+        
+        # Keep columns that pass both criteria
+        keep_missing = missing_frac <= self.missing_threshold
+        keep_variance = (variance > self.variance_threshold) | variance.isna()
+        
+        self.cols_to_keep_ = df.columns[keep_missing & keep_variance].tolist()
+        
+        if len(self.cols_to_keep_) == 0:
+            print("⚠️ WARNING: No columns passed filtering criteria!")
+            self.cols_to_keep_ = df.columns.tolist()[:10]  # Keep at least 10
+        
+        return self
+    
+    def transform(self, X):
+        df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        return df[self.cols_to_keep_].values
+    
+    def get_feature_names_out(self, input_features=None):
+        return np.array(self.cols_to_keep_)
+
+
+class FeatureNameTracker(BaseEstimator, TransformerMixin):
+    """Track feature names through the pipeline."""
+    def __init__(self, feature_names):
+        self.feature_names = feature_names
+        
+    def fit(self, X, y=None):
+        return self
+    
+    def transform(self, X):
+        return X
+    
+    def get_feature_names_out(self, input_features=None):
+        return np.array(self.feature_names)
+
+
+# =============================================================================
+# Step 5: Prepare Data for Machine Learning (NO LEAKAGE VERSION)
+# =============================================================================
+
+def prepare_ml_data(df, sdoh_cols, include_diagnosis=True, exclude_dx_for_temporal=False):
     """
     Prepare feature matrix and target for machine learning.
+    NO PREPROCESSING - keeps raw data with NaNs for pipeline.
     
     Args:
         df: Merged DataFrame
         sdoh_cols: List of SDoH column names
         include_diagnosis: Whether to include dx_* columns as features
+        exclude_dx_for_temporal: If True, exclude dx_* to avoid temporal leakage
     
     Returns:
-        X (features), y (target), feature_names, class_mapping
+        X_raw (features with NaNs), y (target), feature_names, class_mapping
     """
     print("\n" + "=" * 70)
-    print("Step 5: Preparing Data for Machine Learning")
+    print("Step 5: Preparing Data for Machine Learning (NO LEAKAGE)")
     print("=" * 70)
     
     # Get diagnosis columns if requested
     dx_cols = []
-    if include_diagnosis:
+    if include_diagnosis and not exclude_dx_for_temporal:
         dx_cols = [col for col in df.columns if col.startswith('dx_') and col != 'dx_other_count']
         print(f"Found {len(dx_cols)} diagnosis columns")
+        print("⚠️ WARNING: Including dx_* features may cause TEMPORAL LEAKAGE if")
+        print("   diagnoses are from same period as ED visits!")
+        print("   Consider setting exclude_dx_for_temporal=True for robust evaluation.")
+    elif exclude_dx_for_temporal:
+        print("🔒 Excluding dx_* features to prevent temporal leakage")
     
     # Combine features
     feature_cols = sdoh_cols + dx_cols
     print(f"Total features: {len(feature_cols)} ({len(sdoh_cols)} SDoH + {len(dx_cols)} diagnoses)")
     
-    # Extract features and target
-    X = df[feature_cols].copy()
+    # Extract features and target - KEEP RAW DATA WITH NaNs
+    X_raw = df[feature_cols].copy()
     y = df['ed_utilization_class'].copy()
     
     # Remove rows with missing target
     valid_mask = y.notna()
-    X = X[valid_mask]
+    X_raw = X_raw[valid_mask]
     y = y[valid_mask]
     
-    print(f"\nSamples: {len(X):,}")
+    print(f"\nSamples: {len(X_raw):,}")
     print(f"Original target distribution:")
     print(y.value_counts().sort_index())
     
     # IMPORTANT: Remap classes to 0-indexed for XGBoost compatibility
-    # XGBoost requires classes to start from 0
     unique_classes = sorted(y.unique())
     class_mapping = {orig: new for new, orig in enumerate(unique_classes)}
     reverse_mapping = {new: orig for orig, new in class_mapping.items()}
@@ -461,39 +528,29 @@ def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
     print(f"\nRemapped target distribution:")
     print(y_remapped.value_counts().sort_index())
     
-    # Convert to numeric and handle missing values
-    print("\nConverting features to numeric...")
-    for col in X.columns:
-        X[col] = pd.to_numeric(X[col], errors='coerce')
+    # Convert to numeric BUT KEEP NaNs - no imputation here!
+    print("\nConverting features to numeric (keeping NaNs for pipeline)...")
+    for col in X_raw.columns:
+        X_raw[col] = pd.to_numeric(X_raw[col], errors='coerce')
     
-    # Check missingness
-    missing_pct = X.isna().mean()
-    print(f"\nFeatures with >50% missing: {(missing_pct > 0.5).sum()}")
+    # Report missingness for awareness
+    missing_pct = X_raw.isna().mean()
+    print(f"\nMissingness statistics:")
+    print(f"  Features with >50% missing: {(missing_pct > 0.5).sum()}")
+    print(f"  Features with >90% missing: {(missing_pct > 0.9).sum()}")
+    print(f"  Average missingness: {missing_pct.mean():.2%}")
     
-    # Remove features that are all NaN or have zero variance
-    all_nan_cols = X.columns[X.isna().all()]
+    # Remove ONLY completely empty columns (all NaN)
+    all_nan_cols = X_raw.columns[X_raw.isna().all()]
     if len(all_nan_cols) > 0:
-        print(f"Removing {len(all_nan_cols)} completely empty features")
-        X = X.drop(columns=all_nan_cols)
+        print(f"\n⚠️ Removing {len(all_nan_cols)} completely empty features (100% NaN)")
+        X_raw = X_raw.drop(columns=all_nan_cols)
         feature_cols = [c for c in feature_cols if c not in all_nan_cols]
     
-    # Impute missing values with median
-    print("\nImputing missing values with median...")
-    imputer = SimpleImputer(strategy='median')
-    X_imputed = imputer.fit_transform(X)
-    X = pd.DataFrame(X_imputed, columns=feature_cols, index=X.index)
+    print(f"\n✅ Prepared RAW feature matrix: {X_raw.shape}")
+    print("   (NaNs preserved - will be handled in CV pipeline)")
     
-    # Remove zero-variance features
-    variances = X.var()
-    zero_var_cols = variances[variances == 0].index
-    if len(zero_var_cols) > 0:
-        print(f"Removing {len(zero_var_cols)} zero-variance features")
-        X = X.drop(columns=zero_var_cols)
-        feature_cols = [c for c in feature_cols if c not in zero_var_cols]
-    
-    print(f"\nFinal feature matrix: {X.shape}")
-    
-    return X, y_remapped, feature_cols, reverse_mapping
+    return X_raw, y_remapped, feature_cols, reverse_mapping
 
 
 # =============================================================================
@@ -502,23 +559,31 @@ def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
 
 def create_model_pipelines():
     """
-    Create pipelines for different models.
+    Create LEAKAGE-FREE pipelines with all preprocessing inside.
     
     Returns:
         Dictionary of model names and their pipeline objects
     """
     models = {}
     
+    print("\n🔒 Creating leakage-free pipelines...")
+    print("   All preprocessing (column filtering, imputation, scaling)")
+    print("   happens INSIDE cross-validation folds")
+    
     # Random Forest
     models['Random Forest'] = Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
+        ('dropper', ColumnDropper(missing_threshold=MISSING_THRESHOLD, 
+                                   variance_threshold=VARIANCE_THRESHOLD)),
+        ('imputer', KNNImputer(n_neighbors=5, weights='uniform')),
         ('scaler', StandardScaler()),
         ('model', RandomForestClassifier(**RF_PARAMS))
     ])
     
     # Gradient Boosting
     models['Gradient Boosting'] = Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
+        ('dropper', ColumnDropper(missing_threshold=MISSING_THRESHOLD, 
+                                   variance_threshold=VARIANCE_THRESHOLD)),
+        ('imputer', KNNImputer(n_neighbors=5, weights='uniform')),
         ('scaler', StandardScaler()),
         ('model', GradientBoostingClassifier(**GB_PARAMS))
     ])
@@ -526,7 +591,9 @@ def create_model_pipelines():
     # LightGBM (if available)
     if LIGHTGBM_AVAILABLE:
         models['LightGBM'] = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
+            ('dropper', ColumnDropper(missing_threshold=MISSING_THRESHOLD, 
+                                       variance_threshold=VARIANCE_THRESHOLD)),
+            ('imputer', KNNImputer(n_neighbors=5, weights='uniform')),
             ('scaler', StandardScaler()),
             ('model', lgb.LGBMClassifier(**LGBM_PARAMS))
         ])
@@ -534,15 +601,19 @@ def create_model_pipelines():
     # XGBoost (if available)
     if XGBOOST_AVAILABLE:
         models['XGBoost'] = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
+            ('dropper', ColumnDropper(missing_threshold=MISSING_THRESHOLD, 
+                                       variance_threshold=VARIANCE_THRESHOLD)),
+            ('imputer', KNNImputer(n_neighbors=5, weights='uniform')),
             ('scaler', StandardScaler()),
             ('model', xgb.XGBClassifier(**XGB_PARAMS))
         ])
     
-    # CatBoost (if available) - works well with categorical features
+    # CatBoost (if available)
     if CATBOOST_AVAILABLE:
         models['CatBoost'] = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
+            ('dropper', ColumnDropper(missing_threshold=MISSING_THRESHOLD, 
+                                       variance_threshold=VARIANCE_THRESHOLD)),
+            ('imputer', KNNImputer(n_neighbors=5, weights='uniform')),
             ('scaler', StandardScaler()),
             ('model', CatBoostClassifier(**CATBOOST_PARAMS))
         ])
@@ -1040,17 +1111,51 @@ def main():
         print("\n⚠️ WARNING: No SDoH columns found!")
         print("The analysis will proceed with diagnosis features only.")
     
-    # Step 5: Prepare ML data
-    X, y, feature_names, class_mapping = prepare_ml_data(df_merged, sdoh_cols, include_diagnosis=True)
+    # Data quality warnings
+    print("\n" + "=" * 70)
+    print("⚠️  CRITICAL DATA QUALITY WARNINGS")
+    print("=" * 70)
+    print("\n1. TEMPORAL LEAKAGE RISK:")
+    print("   Your dx_* features may be from the SAME TIME PERIOD as ED visits")
+    print("   This causes the model to look great in CV but fail in production")
+    print("   RECOMMENDATION: Use only PRE-INDEX features for prediction")
+    print("   • Set exclude_dx_for_temporal=True to test without dx features")
+    print("   • Better: create time windows (6mo before → predict next 6mo)")
     
-    if len(X) == 0 or len(feature_names) == 0:
+    print("\n2. COHORT DEFINITION ISSUE:")
+    print("   'No ED visits' may actually mean:")
+    print("   • Incomplete ED file coverage")
+    print("   • Member not enrolled during observation window")
+    print("   • ID linkage failure")
+    print("   RECOMMENDATION: Define 'fully observed' cohort")
+    print("   • Require continuous enrollment")
+    print("   • Verify ED data completeness")
+    print("   • Label only members with known observation window")
+    
+    print("\n3. SAMPLE SIZE:")
+    print(f"   You have ~{len(df_merged):,} samples for {len(sdoh_cols)} features")
+    if len(df_merged) < 500:
+        print("   ⚠️ SMALL DATASET - high risk of overfitting even with regularization")
+    
+    print("\n" + "=" * 70)
+    
+    # Step 5: Prepare ML data (TWO OPTIONS)
+    use_temporal_safe_features = False  # Set to True to exclude dx_*
+    
+    X_raw, y, feature_names, class_mapping = prepare_ml_data(
+        df_merged, sdoh_cols, 
+        include_diagnosis=True,
+        exclude_dx_for_temporal=use_temporal_safe_features
+    )
+    
+    if len(X_raw) == 0 or len(feature_names) == 0:
         print("\n❌ ERROR: No valid features or samples for analysis.")
         print("Please check your data files.")
         return
     
     # Step 6: Create model pipelines and perform cross-validation
     models = create_model_pipelines()
-    cv_results_df = cross_validate_models(X, y, models, n_folds=N_CV_FOLDS)
+    cv_results_df = cross_validate_models(X_raw, y, models, n_folds=N_CV_FOLDS)
     
     # Save CV results
     cv_results_df.to_csv('cv_results.csv', index=False)
@@ -1058,7 +1163,7 @@ def main():
     
     # Step 7: Train best model and get feature importances
     importances, best_model, best_model_name = train_best_model_and_get_importances(
-        X, y, feature_names, cv_results_df
+        X_raw, y, feature_names, cv_results_df
     )
     
     # Step 8: Model comparison visualization
@@ -1071,7 +1176,7 @@ def main():
     plot_correlation_heatmap(df_merged, importances, top_n=TOP_N_FEATURES)
     
     # Step 11: CV metrics distribution
-    plot_cv_metrics_boxplot(models, X, y, n_folds=N_CV_FOLDS)
+    plot_cv_metrics_boxplot(models, X_raw, y, n_folds=N_CV_FOLDS)
     
     # Step 12: ED utilization distribution
     plot_ed_utilization_distribution(df_merged)
@@ -1105,9 +1210,25 @@ def main():
     elif best_overfit < 0.1:
         print(f"   ⚠️ Model shows slight overfitting (overfit gap: {best_overfit:.3f})")
     else:
-        print(f"   ⚠️ Model shows significant overfitting (overfit gap: {best_overfit:.3f})")
+        print(f"   🔴 Model shows significant overfitting (overfit gap: {best_overfit:.3f})")
         print("      Consider: more regularization, more data, or simpler model")
     
+    print("\n" + "=" * 70)
+    print("🔬 NEXT STEPS FOR PRODUCTION-READY MODEL:")
+    print("=" * 70)
+    print("1. Implement temporal validation:")
+    print("   • Define index date for each patient")
+    print("   • Features: 6-12 months BEFORE index")
+    print("   • Label: ED visits in 6 months AFTER index")
+    print("   • Split: train on early time, test on later time")
+    print("\n2. Define clean cohort:")
+    print("   • Require continuous enrollment")
+    print("   • Verify complete ED capture")
+    print("   • Exclude members with data quality issues")
+    print("\n3. Validate on truly held-out data:")
+    print("   • Different time period")
+    print("   • Different geographic area")
+    print("   • Track performance drift over time")
     print("\n" + "=" * 70)
     
 
