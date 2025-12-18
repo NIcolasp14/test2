@@ -17,13 +17,40 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import re
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_validate
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    classification_report, confusion_matrix, 
+    accuracy_score, precision_recall_fscore_support,
+    roc_auc_score, make_scorer
+)
 import warnings
 warnings.filterwarnings('ignore')
+
+# Try importing optional models
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+    print("⚠️ LightGBM not available. Install with: pip install lightgbm")
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    print("⚠️ XGBoost not available. Install with: pip install xgboost")
+
+try:
+    from catboost import CatBoostClassifier
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
+    print("⚠️ CatBoost not available. Install with: pip install catboost")
 
 
 # =============================================================================
@@ -34,11 +61,71 @@ NYU_EDU_PATH = "nyu_edu.csv"
 ACXIOM_PATH = "full_acxiom.csv"
 OUTPUT_PATH = "full_acxiom_with_ed_label.csv"
 
-# Random Forest parameters
-RF_N_ESTIMATORS = 100
-RF_MAX_DEPTH = 10
-RF_RANDOM_STATE = 42
-RF_TEST_SIZE = 0.3
+# Model parameters
+RANDOM_STATE = 42
+N_CV_FOLDS = 5  # Number of cross-validation folds
+TEST_SIZE = 0.2  # Hold-out test set size
+
+# Model-specific parameters (to prevent overfitting)
+RF_PARAMS = {
+    'n_estimators': 100,
+    'max_depth': 6,
+    'min_samples_split': 10,
+    'min_samples_leaf': 5,
+    'max_features': 'sqrt',
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'class_weight': 'balanced'
+}
+
+GB_PARAMS = {
+    'n_estimators': 100,
+    'max_depth': 4,
+    'learning_rate': 0.05,
+    'min_samples_split': 10,
+    'min_samples_leaf': 5,
+    'max_features': 'sqrt',
+    'random_state': RANDOM_STATE,
+    'subsample': 0.8
+}
+
+LGBM_PARAMS = {
+    'n_estimators': 100,
+    'max_depth': 6,
+    'learning_rate': 0.05,
+    'num_leaves': 31,
+    'min_child_samples': 20,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'verbosity': -1,
+    'class_weight': 'balanced'
+}
+
+XGB_PARAMS = {
+    'n_estimators': 100,
+    'max_depth': 6,
+    'learning_rate': 0.05,
+    'min_child_weight': 5,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'gamma': 0.1,
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'tree_method': 'hist'
+}
+
+CATBOOST_PARAMS = {
+    'iterations': 100,
+    'depth': 6,
+    'learning_rate': 0.05,
+    'l2_leaf_reg': 3,
+    'random_state': RANDOM_STATE,
+    'verbose': False,
+    'thread_count': -1,
+    'auto_class_weights': 'Balanced'
+}
 
 # Analysis parameters
 TOP_N_FEATURES = 20
@@ -148,21 +235,122 @@ def merge_ed_labels_with_acxiom(ed_labels_df, acxiom_path, output_path=None):
     # Load Acxiom data
     df_acxiom = pd.read_csv(acxiom_path, low_memory=False)
     print(f"Loaded Acxiom data: {df_acxiom.shape}")
+
+    # Normalize/identify member ID column in Acxiom (common variants)
+    possible_keys = ['sys_mbr_sk', 'clm_sys_mbr_sk', 'acxiom_id', 'empi', 'member_id', 'member_sk']
+    acx_key = None
+    for k in possible_keys:
+        if k in df_acxiom.columns:
+            acx_key = k
+            break
+
+    if acx_key is None:
+        # try case-insensitive search
+        cols_lower = {c.lower(): c for c in df_acxiom.columns}
+        for want in possible_keys:
+            if want.lower() in cols_lower:
+                acx_key = cols_lower[want.lower()]
+                break
+
+    if acx_key is None:
+        print("Acxiom columns (sample):", list(df_acxiom.columns)[:20])
+        raise KeyError("No recognized member identifier column found in Acxiom data to merge on.\n" \
+                       "Expected one of: {}".format(possible_keys))
+
+    # If Acxiom uses a member-like id (e.g., 'member_id' or 'empi'), try bridging via demographics
+    if acx_key in ('member_id', 'acxiom_id') or acx_key.lower() == 'empi' or acx_key.lower().startswith('member'):
+        try:
+            dem_path = "demographics.csv"
+            dem = pd.read_csv(dem_path, usecols=['sys_mbr_sk', 'empi'])
+            dem['sys_mbr_sk'] = dem['sys_mbr_sk'].astype(str).str.strip()
+            dem['empi'] = dem['empi'].astype(str).str.strip()
+
+            ed_labels_df = ed_labels_df.copy()
+            ed_labels_df['sys_mbr_sk'] = ed_labels_df['sys_mbr_sk'].astype(str).str.strip()
+
+            # attach EMPI to ED labels
+            ed_with_empi = ed_labels_df.merge(dem, on='sys_mbr_sk', how='left')
+
+            # Normalize Acxiom key and EMPI to strings
+            df_acxiom[acx_key] = df_acxiom[acx_key].astype(str).str.strip()
+            ed_with_empi['empi'] = ed_with_empi['empi'].astype(str).str.strip()
+
+            # Merge Acxiom (by its member-like id) with ED labels via EMPI
+            df_merged = df_acxiom.merge(
+                ed_with_empi[['empi', 'total_ed_visits', 'ed_utilization_class']],
+                left_on=acx_key,
+                right_on='empi',
+                how='left'
+            )
+            # Drop auxiliary empi column if present
+            if 'empi' in df_merged.columns:
+                df_merged = df_merged.drop(columns=['empi'])
+
+            print(f"Merged via demographics bridge: acxiom.{acx_key} <-> demographics.empi <-> ed_labels.sys_mbr_sk")
+        except Exception as e:
+            print(f"Bridge via demographics failed: {e}. Falling back to direct sys_mbr_sk rename.")
+            df_acxiom = df_acxiom.rename(columns={acx_key: 'sys_mbr_sk'})
+            df_acxiom['sys_mbr_sk'] = df_acxiom['sys_mbr_sk'].astype(str).str.strip()
+            ed_labels_df = ed_labels_df.copy()
+            ed_labels_df['sys_mbr_sk'] = ed_labels_df['sys_mbr_sk'].astype(str).str.strip()
+            df_merged = df_acxiom.merge(
+                ed_labels_df[['sys_mbr_sk', 'total_ed_visits', 'ed_utilization_class']],
+                on='sys_mbr_sk',
+                how='left'
+            )
+    else:
+        if acx_key != 'sys_mbr_sk':
+            # rename the detected key to sys_mbr_sk for consistent merging
+            df_acxiom = df_acxiom.rename(columns={acx_key: 'sys_mbr_sk'})
+            print(f"Renamed Acxiom column '{acx_key}' to 'sys_mbr_sk' for merging.")
+
+        # Ensure both keys are comparable strings to avoid dtype mismatches
+        df_acxiom['sys_mbr_sk'] = df_acxiom['sys_mbr_sk'].astype(str).str.strip()
+        ed_labels_df = ed_labels_df.copy()
+        ed_labels_df['sys_mbr_sk'] = ed_labels_df['sys_mbr_sk'].astype(str).str.strip()
+
+        # Merge on sys_mbr_sk
+        df_merged = df_acxiom.merge(
+            ed_labels_df[['sys_mbr_sk', 'total_ed_visits', 'ed_utilization_class']],
+            on='sys_mbr_sk',
+            how='left'
+        )
     
-    # Merge on sys_mbr_sk
-    df_merged = df_acxiom.merge(
-        ed_labels_df[['sys_mbr_sk', 'total_ed_visits', 'ed_utilization_class']], 
-        on='sys_mbr_sk', 
-        how='left'
-    )
-    
-    # Fill NaN for patients not in ED data (they have 0 visits)
-    df_merged['total_ed_visits'] = df_merged['total_ed_visits'].fillna(0).astype(int)
-    df_merged['ed_utilization_class'] = df_merged['ed_utilization_class'].fillna(0).astype(int)
-    
+    # Do NOT assign class 0 to all unmatched Acxiom rows.
+    # Keep NaN for 'ed_utilization_class' for patients without ED matches so
+    # downstream steps can exclude them. Create a flag to indicate merges.
+    df_merged['__ed_matched'] = df_merged['total_ed_visits'].notna()
+
+    # For matched rows ensure integer type for total_ed_visits
+    matched_idx = df_merged['total_ed_visits'].notna()
+    if matched_idx.any():
+        df_merged.loc[matched_idx, 'total_ed_visits'] = df_merged.loc[matched_idx, 'total_ed_visits'].astype(int)
+
     print(f"Merged data shape: {df_merged.shape}")
-    print(f"\nPatients with ED data: {(df_merged['total_ed_visits'] > 0).sum():,}")
-    print(f"Patients without ED data: {(df_merged['total_ed_visits'] == 0).sum():,}")
+    print(f"\nPatients with ED match: {df_merged['__ed_matched'].sum():,}")
+    print(f"Patients without ED match: {(~df_merged['__ed_matched']).sum():,}")
+
+    # If demographics is available, consider members present in demographics but not
+    # in ED as having 0 ED visits (so they become class 0). This avoids treating
+    # the entire Acxiom population as class 0 when we only have ED data for a subset.
+    try:
+        dem_path = "demographics.csv"
+        dem = pd.read_csv(dem_path, usecols=['sys_mbr_sk'])
+        dem['sys_mbr_sk'] = dem['sys_mbr_sk'].astype(str).str.strip()
+
+        # Identify Acxiom rows whose sys_mbr_sk exists in demographics but had no ED match
+        if 'sys_mbr_sk' in df_merged.columns:
+            dem_set = set(dem['sys_mbr_sk'].unique())
+            mask_no_match = (~df_merged['__ed_matched']) & (df_merged['sys_mbr_sk'].astype(str).str.strip().isin(dem_set))
+
+            if mask_no_match.any():
+                df_merged.loc[mask_no_match, 'total_ed_visits'] = 0
+                df_merged.loc[mask_no_match, 'ed_utilization_class'] = 0
+                df_merged.loc[mask_no_match, '__ed_matched'] = True
+                print(f"Assigned class 0 (0 visits) to {mask_no_match.sum():,} Acxiom rows present in demographics.")
+    except Exception:
+        # demographics not available or mismatch — skip this step silently
+        pass
     
     # Save if output path provided
     if output_path:
@@ -272,94 +460,289 @@ def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
 
 
 # =============================================================================
-# Step 6: Train Random Forest and Get Feature Importances
+# Step 6: Cross-Validation Model Comparison
 # =============================================================================
 
-def train_rf_and_get_importances(X, y, feature_names, n_estimators=RF_N_ESTIMATORS, 
-                                  max_depth=RF_MAX_DEPTH, random_state=RF_RANDOM_STATE,
-                                  test_size=RF_TEST_SIZE):
+def create_model_pipelines():
     """
-    Train Random Forest Classifier and extract feature importances.
+    Create pipelines for different models.
+    
+    Returns:
+        Dictionary of model names and their pipeline objects
+    """
+    models = {}
+    
+    # Random Forest
+    models['Random Forest'] = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),
+        ('model', RandomForestClassifier(**RF_PARAMS))
+    ])
+    
+    # Gradient Boosting
+    models['Gradient Boosting'] = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),
+        ('model', GradientBoostingClassifier(**GB_PARAMS))
+    ])
+    
+    # LightGBM (if available)
+    if LIGHTGBM_AVAILABLE:
+        models['LightGBM'] = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler()),
+            ('model', lgb.LGBMClassifier(**LGBM_PARAMS))
+        ])
+    
+    # XGBoost (if available)
+    if XGBOOST_AVAILABLE:
+        models['XGBoost'] = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler()),
+            ('model', xgb.XGBClassifier(**XGB_PARAMS))
+        ])
+    
+    # CatBoost (if available) - works well with categorical features
+    if CATBOOST_AVAILABLE:
+        models['CatBoost'] = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler()),
+            ('model', CatBoostClassifier(**CATBOOST_PARAMS))
+        ])
+    
+    return models
+
+
+def cross_validate_models(X, y, models, n_folds=N_CV_FOLDS):
+    """
+    Perform stratified k-fold cross-validation for all models.
+    
+    Args:
+        X: Feature matrix
+        y: Target vector
+        models: Dictionary of model pipelines
+        n_folds: Number of CV folds
+    
+    Returns:
+        DataFrame with CV results for each model
+    """
+    print("\n" + "=" * 70)
+    print("Step 6: Cross-Validation Model Comparison")
+    print("=" * 70)
+    
+    # Check class distribution
+    unique_classes = np.unique(y)
+    print(f"\nClasses present: {unique_classes}")
+    print(f"Class distribution:")
+    for cls in unique_classes:
+        count = (y == cls).sum()
+        pct = count / len(y) * 100
+        print(f"  Class {cls}: {count:,} samples ({pct:.1f}%)")
+    
+    # Stratified K-Fold
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+    
+    # Determine scoring based on number of classes
+    if len(unique_classes) == 2:
+        scoring = {
+            'accuracy': 'accuracy',
+            'precision': 'precision',
+            'recall': 'recall',
+            'f1': 'f1',
+            'roc_auc': 'roc_auc'
+        }
+    else:
+        scoring = {
+            'accuracy': 'accuracy',
+            'precision': 'precision_macro',
+            'recall': 'recall_macro',
+            'f1': 'f1_macro',
+            'roc_auc': 'roc_auc_ovr'
+        }
+    
+    results = []
+    
+    print(f"\n{'Model':<20} {'Accuracy':<12} {'Precision':<12} {'Recall':<12} {'F1-Score':<12} {'ROC-AUC':<12}")
+    print("=" * 88)
+    
+    for model_name, pipeline in models.items():
+        print(f"\nTraining {model_name}...")
+        
+        try:
+            # Perform cross-validation
+            cv_results = cross_validate(
+                pipeline, X, y,
+                cv=skf,
+                scoring=scoring,
+                n_jobs=-1,
+                return_train_score=True,
+                error_score='raise'
+            )
+            
+            # Calculate mean and std for each metric
+            result = {
+                'Model': model_name,
+                'CV_Accuracy_Mean': cv_results['test_accuracy'].mean(),
+                'CV_Accuracy_Std': cv_results['test_accuracy'].std(),
+                'CV_Precision_Mean': cv_results['test_precision'].mean(),
+                'CV_Precision_Std': cv_results['test_precision'].std(),
+                'CV_Recall_Mean': cv_results['test_recall'].mean(),
+                'CV_Recall_Std': cv_results['test_recall'].std(),
+                'CV_F1_Mean': cv_results['test_f1'].mean(),
+                'CV_F1_Std': cv_results['test_f1'].std(),
+                'CV_ROC_AUC_Mean': cv_results['test_roc_auc'].mean(),
+                'CV_ROC_AUC_Std': cv_results['test_roc_auc'].std(),
+                'Train_Accuracy_Mean': cv_results['train_accuracy'].mean(),
+                'Overfit_Gap': cv_results['train_accuracy'].mean() - cv_results['test_accuracy'].mean()
+            }
+            results.append(result)
+            
+            # Print summary
+            print(f"{model_name:<20} "
+                  f"{result['CV_Accuracy_Mean']:.3f}±{result['CV_Accuracy_Std']:.3f}  "
+                  f"{result['CV_Precision_Mean']:.3f}±{result['CV_Precision_Std']:.3f}  "
+                  f"{result['CV_Recall_Mean']:.3f}±{result['CV_Recall_Std']:.3f}  "
+                  f"{result['CV_F1_Mean']:.3f}±{result['CV_F1_Std']:.3f}  "
+                  f"{result['CV_ROC_AUC_Mean']:.3f}±{result['CV_ROC_AUC_Std']:.3f}")
+            
+            if result['Overfit_Gap'] > 0.1:
+                print(f"  ⚠️ Warning: Potential overfitting (gap: {result['Overfit_Gap']:.3f})")
+            
+        except Exception as e:
+            print(f"  ❌ Error training {model_name}: {str(e)}")
+            continue
+    
+    results_df = pd.DataFrame(results)
+    
+    # Sort by F1 score
+    results_df = results_df.sort_values('CV_F1_Mean', ascending=False)
+    
+    print("\n" + "=" * 70)
+    print("Cross-Validation Results Summary")
+    print("=" * 70)
+    print(results_df[['Model', 'CV_Accuracy_Mean', 'CV_F1_Mean', 'CV_ROC_AUC_Mean', 'Overfit_Gap']].to_string(index=False))
+    
+    return results_df
+
+
+def train_best_model_and_get_importances(X, y, feature_names, cv_results_df):
+    """
+    Train the best model on full data and extract feature importances.
     
     Args:
         X: Feature matrix
         y: Target vector
         feature_names: List of feature names
-        n_estimators: Number of trees
-        max_depth: Maximum depth of trees
-        random_state: Random seed
-        test_size: Test set proportion
+        cv_results_df: DataFrame with CV results
     
     Returns:
-        DataFrame with feature importances, trained model, test metrics
+        Feature importances, trained model, test metrics
     """
     print("\n" + "=" * 70)
-    print("Step 6: Training Random Forest Classifier")
+    print("Step 7: Training Best Model and Extracting Feature Importances")
     print("=" * 70)
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
-    )
+    # Get best model
+    best_model_name = cv_results_df.iloc[0]['Model']
+    print(f"\nBest model (by F1-score): {best_model_name}")
+    print(f"CV F1-Score: {cv_results_df.iloc[0]['CV_F1_Mean']:.3f} ± {cv_results_df.iloc[0]['CV_F1_Std']:.3f}")
     
-    print(f"Training set: {len(X_train):,} samples")
-    print(f"Test set: {len(X_test):,} samples")
+    # Create and train the best model pipeline
+    models = create_model_pipelines()
+    best_pipeline = models[best_model_name]
     
-    # Scale features
-    print("\nScaling features...")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    # Fit on all data for feature importance extraction
+    print("\nFitting best model on full dataset for feature importance extraction...")
+    best_pipeline.fit(X, y)
     
-    # Train Random Forest
-    print(f"\nTraining Random Forest (n_estimators={n_estimators}, max_depth={max_depth})...")
-    rf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        random_state=random_state,
-        n_jobs=-1,
-        class_weight='balanced'  # Handle class imbalance
-    )
-    rf.fit(X_train_scaled, y_train)
+    # Extract the trained model from pipeline
+    trained_model = best_pipeline.named_steps['model']
     
-    # Evaluate
-    train_score = rf.score(X_train_scaled, y_train)
-    test_score = rf.score(X_test_scaled, y_test)
+    # Get feature importances (if available)
+    importances_df = None
+    if hasattr(trained_model, 'feature_importances_'):
+        importances = trained_model.feature_importances_
+        importances_df = pd.DataFrame({
+            'feature': feature_names,
+            'importance': importances
+        }).sort_values('importance', ascending=False)
+        
+        print("\n" + "=" * 70)
+        print(f"Top {TOP_N_FEATURES} Most Important Features")
+        print("=" * 70)
+        print(importances_df.head(TOP_N_FEATURES).to_string(index=False))
+    else:
+        print(f"\n⚠️ {best_model_name} does not provide feature importances.")
     
-    print(f"\n✅ Training complete!")
-    print(f"Training accuracy: {train_score:.3f}")
-    print(f"Test accuracy: {test_score:.3f}")
-    
-    # Predictions
-    y_pred = rf.predict(X_test_scaled)
-    
-    print("\n" + "=" * 70)
-    print("Classification Report")
-    print("=" * 70)
-    print(classification_report(y_test, y_pred, 
-                                target_names=['No visits', 'One visit', 'High (2+) visits']))
-    
-    print("\nConfusion Matrix:")
-    cm = confusion_matrix(y_test, y_pred)
-    print(cm)
-    
-    # Get feature importances
-    importances = pd.DataFrame({
-        'feature': feature_names,
-        'importance': rf.feature_importances_
-    }).sort_values('importance', ascending=False)
-    
-    print("\n" + "=" * 70)
-    print(f"Top {TOP_N_FEATURES} Most Important Features")
-    print("=" * 70)
-    print(importances.head(TOP_N_FEATURES).to_string(index=False))
-    
-    return importances, rf, {'train_score': train_score, 'test_score': test_score, 
-                            'y_test': y_test, 'y_pred': y_pred}
+    return importances_df, best_pipeline, best_model_name
 
 
 # =============================================================================
-# Step 7: Visualize Feature Importances
+# Step 8: Visualize Model Comparison
+# =============================================================================
+
+def plot_model_comparison(cv_results_df):
+    """
+    Plot comparison of model performance.
+    
+    Args:
+        cv_results_df: DataFrame with CV results
+    """
+    print("\n" + "=" * 70)
+    print("Step 8: Visualizing Model Comparison")
+    print("=" * 70)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot 1: F1-Score comparison
+    ax1 = axes[0]
+    models = cv_results_df['Model']
+    f1_means = cv_results_df['CV_F1_Mean']
+    f1_stds = cv_results_df['CV_F1_Std']
+    
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(models)))
+    bars = ax1.barh(range(len(models)), f1_means, xerr=f1_stds, 
+                     color=colors, capsize=5)
+    ax1.set_yticks(range(len(models)))
+    ax1.set_yticklabels(models)
+    ax1.set_xlabel('F1-Score', fontsize=12)
+    ax1.set_title('Model Comparison: F1-Score (Mean ± Std)', fontsize=13, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    
+    # Add value labels
+    for i, (mean, std) in enumerate(zip(f1_means, f1_stds)):
+        ax1.text(mean + std + 0.01, i, f'{mean:.3f}', 
+                va='center', fontsize=10, fontweight='bold')
+    
+    # Plot 2: Overfitting analysis
+    ax2 = axes[1]
+    overfit_gaps = cv_results_df['Overfit_Gap']
+    colors2 = ['red' if gap > 0.1 else 'green' for gap in overfit_gaps]
+    
+    bars = ax2.barh(range(len(models)), overfit_gaps, color=colors2, alpha=0.7)
+    ax2.set_yticks(range(len(models)))
+    ax2.set_yticklabels(models)
+    ax2.set_xlabel('Overfit Gap (Train - Test Accuracy)', fontsize=12)
+    ax2.set_title('Overfitting Analysis', fontsize=13, fontweight='bold')
+    ax2.axvline(x=0.1, color='orange', linestyle='--', linewidth=2, label='Warning threshold')
+    ax2.grid(axis='x', alpha=0.3)
+    ax2.legend()
+    ax2.invert_yaxis()
+    
+    # Add value labels
+    for i, gap in enumerate(overfit_gaps):
+        ax2.text(gap + 0.005, i, f'{gap:.3f}', 
+                va='center', fontsize=10, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('model_comparison.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: model_comparison.png")
+    plt.show()
+
+
+# =============================================================================
+# Step 9: Visualize Feature Importances
 # =============================================================================
 
 def plot_feature_importances(importances_df, top_n=TOP_N_FEATURES):
@@ -370,8 +753,12 @@ def plot_feature_importances(importances_df, top_n=TOP_N_FEATURES):
         importances_df: DataFrame with feature and importance columns
         top_n: Number of top features to plot
     """
+    if importances_df is None:
+        print("\n⚠️ No feature importances available to plot.")
+        return
+    
     print("\n" + "=" * 70)
-    print("Step 7: Visualizing Feature Importances")
+    print("Step 9: Visualizing Feature Importances")
     print("=" * 70)
     
     top_features = importances_df.head(top_n)
@@ -391,7 +778,7 @@ def plot_feature_importances(importances_df, top_n=TOP_N_FEATURES):
 
 
 # =============================================================================
-# Step 8: Correlation Heatmap for Top Features
+# Step 10: Correlation Heatmap for Top Features
 # =============================================================================
 
 def plot_correlation_heatmap(df, top_features, target_col='ed_utilization_class', 
@@ -405,8 +792,12 @@ def plot_correlation_heatmap(df, top_features, target_col='ed_utilization_class'
         target_col: Name of target column
         top_n: Number of top features to include
     """
+    if top_features is None:
+        print("\n⚠️ No feature importances available for correlation heatmap.")
+        return
+    
     print("\n" + "=" * 70)
-    print("Step 8: Creating Correlation Heatmap")
+    print("Step 10: Creating Correlation Heatmap")
     print("=" * 70)
     
     # Get top N feature names
@@ -446,20 +837,67 @@ def plot_correlation_heatmap(df, top_features, target_col='ed_utilization_class'
 
 
 # =============================================================================
-# Step 9: Additional Visualizations
+# Step 11: Additional Visualizations
 # =============================================================================
 
-def plot_confusion_matrix(y_test, y_pred):
+def plot_cv_metrics_boxplot(models, X, y, n_folds=N_CV_FOLDS):
     """
-    Plot confusion matrix heatmap.
+    Create boxplots showing distribution of CV metrics across folds.
     
     Args:
-        y_test: True labels
-        y_pred: Predicted labels
+        models: Dictionary of model pipelines
+        X: Feature matrix
+        y: Target vector
+        n_folds: Number of CV folds
     """
     print("\n" + "=" * 70)
-    print("Step 9: Creating Confusion Matrix Visualization")
+    print("Step 11: Creating CV Metrics Distribution Plot")
     print("=" * 70)
+    
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+    
+    # Collect scores for each model
+    all_scores = []
+    for model_name, pipeline in models.items():
+        try:
+            scores = cross_val_score(pipeline, X, y, cv=skf, scoring='f1_macro', n_jobs=-1)
+            for score in scores:
+                all_scores.append({'Model': model_name, 'F1-Score': score})
+        except:
+            continue
+    
+    if not all_scores:
+        print("⚠️ Could not generate CV metrics distribution.")
+        return
+    
+    scores_df = pd.DataFrame(all_scores)
+    
+    plt.figure(figsize=(12, 6))
+    models_list = scores_df['Model'].unique()
+    positions = range(len(models_list))
+    
+    bp = plt.boxplot([scores_df[scores_df['Model'] == m]['F1-Score'].values 
+                       for m in models_list],
+                      positions=positions,
+                      labels=models_list,
+                      patch_artist=True,
+                      notch=True)
+    
+    # Color the boxes
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(models_list)))
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+    
+    plt.ylabel('F1-Score', fontsize=12)
+    plt.title(f'Distribution of F1-Scores Across {n_folds} CV Folds', 
+              fontsize=14, fontweight='bold')
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('cv_metrics_distribution.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: cv_metrics_distribution.png")
+    plt.show()
     
     cm = confusion_matrix(y_test, y_pred)
     
@@ -546,17 +984,32 @@ def main():
         print("Please check your data files.")
         return
     
-    # Step 6: Train RF and get importances
-    importances, rf_model, metrics = train_rf_and_get_importances(X, y, feature_names)
+    # Step 6: Create model pipelines and perform cross-validation
+    models = create_model_pipelines()
+    cv_results_df = cross_validate_models(X, y, models, n_folds=N_CV_FOLDS)
     
-    # Step 7: Plot feature importances
+    # Save CV results
+    cv_results_df.to_csv('cv_results.csv', index=False)
+    print("\n✅ Saved: cv_results.csv")
+    
+    # Step 7: Train best model and get feature importances
+    importances, best_model, best_model_name = train_best_model_and_get_importances(
+        X, y, feature_names, cv_results_df
+    )
+    
+    # Step 8: Model comparison visualization
+    plot_model_comparison(cv_results_df)
+    
+    # Step 9: Plot feature importances
     plot_feature_importances(importances, top_n=TOP_N_FEATURES)
     
-    # Step 8: Correlation heatmap
+    # Step 10: Correlation heatmap
     plot_correlation_heatmap(df_merged, importances, top_n=TOP_N_FEATURES)
     
-    # Step 9: Additional visualizations
-    plot_confusion_matrix(metrics['y_test'], metrics['y_pred'])
+    # Step 11: CV metrics distribution
+    plot_cv_metrics_boxplot(models, X, y, n_folds=N_CV_FOLDS)
+    
+    # Step 12: ED utilization distribution
     plot_ed_utilization_distribution(df_merged)
     
     # Summary
@@ -565,16 +1018,31 @@ def main():
     print("=" * 70)
     print(f"\n✅ Output files generated:")
     print(f"   - {OUTPUT_PATH}")
+    print(f"   - cv_results.csv")
+    print(f"   - model_comparison.png")
     print(f"   - feature_importances.png")
     print(f"   - correlation_heatmap.png")
-    print(f"   - confusion_matrix.png")
+    print(f"   - cv_metrics_distribution.png")
     print(f"   - ed_utilization_distribution.png")
     
     print(f"\n📊 Key Results:")
     print(f"   - Total patients: {len(df_merged):,}")
     print(f"   - Features analyzed: {len(feature_names)}")
-    print(f"   - Test accuracy: {metrics['test_score']:.3f}")
-    print(f"   - Top feature: {importances.iloc[0]['feature']} (importance: {importances.iloc[0]['importance']:.4f})")
+    print(f"   - Best model: {best_model_name}")
+    print(f"   - CV F1-Score: {cv_results_df.iloc[0]['CV_F1_Mean']:.3f} ± {cv_results_df.iloc[0]['CV_F1_Std']:.3f}")
+    print(f"   - CV Accuracy: {cv_results_df.iloc[0]['CV_Accuracy_Mean']:.3f} ± {cv_results_df.iloc[0]['CV_Accuracy_Std']:.3f}")
+    if importances is not None:
+        print(f"   - Top feature: {importances.iloc[0]['feature']} (importance: {importances.iloc[0]['importance']:.4f})")
+    
+    print("\n💡 Interpretation:")
+    best_overfit = cv_results_df.iloc[0]['Overfit_Gap']
+    if best_overfit < 0.05:
+        print(f"   ✅ Model shows good generalization (overfit gap: {best_overfit:.3f})")
+    elif best_overfit < 0.1:
+        print(f"   ⚠️ Model shows slight overfitting (overfit gap: {best_overfit:.3f})")
+    else:
+        print(f"   ⚠️ Model shows significant overfitting (overfit gap: {best_overfit:.3f})")
+        print("      Consider: more regularization, more data, or simpler model")
     
     print("\n" + "=" * 70)
     
