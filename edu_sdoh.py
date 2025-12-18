@@ -66,65 +66,78 @@ RANDOM_STATE = 42
 N_CV_FOLDS = 5  # Number of cross-validation folds
 TEST_SIZE = 0.2  # Hold-out test set size
 
-# Model-specific parameters (to prevent overfitting)
+# Model-specific parameters (AGGRESSIVE regularization to prevent overfitting)
 RF_PARAMS = {
-    'n_estimators': 100,
-    'max_depth': 6,
-    'min_samples_split': 10,
-    'min_samples_leaf': 5,
+    'n_estimators': 50,  # Reduced from 100
+    'max_depth': 4,      # Reduced from 6
+    'min_samples_split': 20,  # Increased from 10
+    'min_samples_leaf': 10,   # Increased from 5
     'max_features': 'sqrt',
     'random_state': RANDOM_STATE,
     'n_jobs': -1,
-    'class_weight': 'balanced'
+    'class_weight': 'balanced',
+    'max_samples': 0.7  # Bootstrap with only 70% of samples
 }
 
 GB_PARAMS = {
-    'n_estimators': 100,
-    'max_depth': 4,
-    'learning_rate': 0.05,
-    'min_samples_split': 10,
-    'min_samples_leaf': 5,
+    'n_estimators': 50,      # Reduced from 100
+    'max_depth': 3,          # Reduced from 4
+    'learning_rate': 0.01,   # Reduced from 0.05 (slower learning)
+    'min_samples_split': 20, # Increased from 10
+    'min_samples_leaf': 10,  # Increased from 5
     'max_features': 'sqrt',
     'random_state': RANDOM_STATE,
-    'subsample': 0.8
+    'subsample': 0.7,        # Reduced from 0.8
+    'validation_fraction': 0.1,
+    'n_iter_no_change': 10,  # Early stopping
+    'tol': 0.001
 }
 
 LGBM_PARAMS = {
-    'n_estimators': 100,
-    'max_depth': 6,
-    'learning_rate': 0.05,
-    'num_leaves': 31,
-    'min_child_samples': 20,
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
+    'n_estimators': 50,          # Reduced from 100
+    'max_depth': 4,              # Reduced from 6
+    'learning_rate': 0.01,       # Reduced from 0.05
+    'num_leaves': 15,            # Reduced from 31
+    'min_child_samples': 30,     # Increased from 20
+    'subsample': 0.7,            # Reduced from 0.8
+    'colsample_bytree': 0.7,     # Reduced from 0.8
+    'reg_alpha': 0.1,            # L1 regularization
+    'reg_lambda': 1.0,           # L2 regularization (increased)
     'random_state': RANDOM_STATE,
     'n_jobs': -1,
     'verbosity': -1,
-    'class_weight': 'balanced'
+    'class_weight': 'balanced',
+    'min_split_gain': 0.01       # Minimum gain to split
 }
 
 XGB_PARAMS = {
-    'n_estimators': 100,
-    'max_depth': 6,
-    'learning_rate': 0.05,
-    'min_child_weight': 5,
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
-    'gamma': 0.1,
+    'n_estimators': 50,          # Reduced from 100
+    'max_depth': 3,              # Reduced from 6
+    'learning_rate': 0.01,       # Reduced from 0.05
+    'min_child_weight': 10,      # Increased from 5
+    'subsample': 0.7,            # Reduced from 0.8
+    'colsample_bytree': 0.7,     # Reduced from 0.8
+    'gamma': 0.2,                # Increased from 0.1 (more pruning)
+    'reg_alpha': 0.1,            # L1 regularization
+    'reg_lambda': 1.5,           # L2 regularization (increased)
     'random_state': RANDOM_STATE,
     'n_jobs': -1,
-    'tree_method': 'hist'
+    'tree_method': 'hist',
+    'eval_metric': 'logloss'
 }
 
 CATBOOST_PARAMS = {
-    'iterations': 100,
-    'depth': 6,
-    'learning_rate': 0.05,
-    'l2_leaf_reg': 3,
+    'iterations': 50,            # Reduced from 100
+    'depth': 4,                  # Reduced from 6
+    'learning_rate': 0.01,       # Reduced from 0.05
+    'l2_leaf_reg': 5,            # Increased from 3
     'random_state': RANDOM_STATE,
     'verbose': False,
     'thread_count': -1,
-    'auto_class_weights': 'Balanced'
+    'auto_class_weights': 'Balanced',
+    'min_data_in_leaf': 10,      # Minimum samples per leaf
+    'max_leaves': 16,            # Limit leaf nodes
+    'subsample': 0.7             # Use 70% of data
 }
 
 # Analysis parameters
@@ -403,7 +416,7 @@ def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
         include_diagnosis: Whether to include dx_* columns as features
     
     Returns:
-        X (features), y (target), feature_names
+        X (features), y (target), feature_names, class_mapping
     """
     print("\n" + "=" * 70)
     print("Step 5: Preparing Data for Machine Learning")
@@ -429,8 +442,24 @@ def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
     y = y[valid_mask]
     
     print(f"\nSamples: {len(X):,}")
-    print(f"Target distribution:")
+    print(f"Original target distribution:")
     print(y.value_counts().sort_index())
+    
+    # IMPORTANT: Remap classes to 0-indexed for XGBoost compatibility
+    # XGBoost requires classes to start from 0
+    unique_classes = sorted(y.unique())
+    class_mapping = {orig: new for new, orig in enumerate(unique_classes)}
+    reverse_mapping = {new: orig for orig, new in class_mapping.items()}
+    
+    y_remapped = y.map(class_mapping)
+    
+    print(f"\nRemapped classes for model compatibility:")
+    print(f"  Original → New")
+    for orig, new in class_mapping.items():
+        print(f"  Class {int(orig)} → Class {new}")
+    
+    print(f"\nRemapped target distribution:")
+    print(y_remapped.value_counts().sort_index())
     
     # Convert to numeric and handle missing values
     print("\nConverting features to numeric...")
@@ -441,7 +470,7 @@ def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
     missing_pct = X.isna().mean()
     print(f"\nFeatures with >50% missing: {(missing_pct > 0.5).sum()}")
     
-    # Remove features that are all NaN
+    # Remove features that are all NaN or have zero variance
     all_nan_cols = X.columns[X.isna().all()]
     if len(all_nan_cols) > 0:
         print(f"Removing {len(all_nan_cols)} completely empty features")
@@ -454,9 +483,17 @@ def prepare_ml_data(df, sdoh_cols, include_diagnosis=True):
     X_imputed = imputer.fit_transform(X)
     X = pd.DataFrame(X_imputed, columns=feature_cols, index=X.index)
     
+    # Remove zero-variance features
+    variances = X.var()
+    zero_var_cols = variances[variances == 0].index
+    if len(zero_var_cols) > 0:
+        print(f"Removing {len(zero_var_cols)} zero-variance features")
+        X = X.drop(columns=zero_var_cols)
+        feature_cols = [c for c in feature_cols if c not in zero_var_cols]
+    
     print(f"\nFinal feature matrix: {X.shape}")
     
-    return X, y, feature_cols
+    return X, y_remapped, feature_cols, reverse_mapping
 
 
 # =============================================================================
@@ -519,7 +556,7 @@ def cross_validate_models(X, y, models, n_folds=N_CV_FOLDS):
     
     Args:
         X: Feature matrix
-        y: Target vector
+        y: Target vector (0-indexed)
         models: Dictionary of model pipelines
         n_folds: Number of CV folds
     
@@ -532,12 +569,18 @@ def cross_validate_models(X, y, models, n_folds=N_CV_FOLDS):
     
     # Check class distribution
     unique_classes = np.unique(y)
-    print(f"\nClasses present: {unique_classes}")
+    print(f"\nClasses present (0-indexed): {unique_classes}")
     print(f"Class distribution:")
     for cls in unique_classes:
         count = (y == cls).sum()
         pct = count / len(y) * 100
-        print(f"  Class {cls}: {count:,} samples ({pct:.1f}%)")
+        print(f"  Class {int(cls)}: {count:,} samples ({pct:.1f}%)")
+    
+    # Check if we have enough samples per class
+    min_samples_per_class = min((y == cls).sum() for cls in unique_classes)
+    if min_samples_per_class < n_folds:
+        n_folds = max(2, min_samples_per_class)
+        print(f"\n⚠️ Reducing n_folds to {n_folds} due to small class size")
     
     # Stratified K-Fold
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
@@ -574,9 +617,10 @@ def cross_validate_models(X, y, models, n_folds=N_CV_FOLDS):
                 pipeline, X, y,
                 cv=skf,
                 scoring=scoring,
-                n_jobs=-1,
+                n_jobs=1,  # Changed from -1 to avoid multiprocessing issues
                 return_train_score=True,
-                error_score='raise'
+                error_score='raise',
+                verbose=0
             )
             
             # Calculate mean and std for each metric
@@ -593,6 +637,7 @@ def cross_validate_models(X, y, models, n_folds=N_CV_FOLDS):
                 'CV_ROC_AUC_Mean': cv_results['test_roc_auc'].mean(),
                 'CV_ROC_AUC_Std': cv_results['test_roc_auc'].std(),
                 'Train_Accuracy_Mean': cv_results['train_accuracy'].mean(),
+                'Train_Accuracy_Std': cv_results['train_accuracy'].std(),
                 'Overfit_Gap': cv_results['train_accuracy'].mean() - cv_results['test_accuracy'].mean()
             }
             results.append(result)
@@ -605,12 +650,24 @@ def cross_validate_models(X, y, models, n_folds=N_CV_FOLDS):
                   f"{result['CV_F1_Mean']:.3f}±{result['CV_F1_Std']:.3f}  "
                   f"{result['CV_ROC_AUC_Mean']:.3f}±{result['CV_ROC_AUC_Std']:.3f}")
             
-            if result['Overfit_Gap'] > 0.1:
-                print(f"  ⚠️ Warning: Potential overfitting (gap: {result['Overfit_Gap']:.3f})")
+            if result['Overfit_Gap'] > 0.15:
+                print(f"  🔴 Severe overfitting (gap: {result['Overfit_Gap']:.3f})")
+            elif result['Overfit_Gap'] > 0.10:
+                print(f"  ⚠️ Moderate overfitting (gap: {result['Overfit_Gap']:.3f})")
+            elif result['Overfit_Gap'] > 0.05:
+                print(f"  ⚡ Slight overfitting (gap: {result['Overfit_Gap']:.3f})")
+            else:
+                print(f"  ✅ Good generalization (gap: {result['Overfit_Gap']:.3f})")
             
         except Exception as e:
             print(f"  ❌ Error training {model_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             continue
+    
+    if not results:
+        print("\n❌ No models completed successfully!")
+        return pd.DataFrame()
     
     results_df = pd.DataFrame(results)
     
@@ -621,6 +678,13 @@ def cross_validate_models(X, y, models, n_folds=N_CV_FOLDS):
     print("Cross-Validation Results Summary")
     print("=" * 70)
     print(results_df[['Model', 'CV_Accuracy_Mean', 'CV_F1_Mean', 'CV_ROC_AUC_Mean', 'Overfit_Gap']].to_string(index=False))
+    
+    # Print interpretation
+    print("\n📊 Overfitting Analysis:")
+    print("  ✅ Gap < 0.05: Excellent generalization")
+    print("  ⚡ Gap 0.05-0.10: Acceptable")
+    print("  ⚠️ Gap 0.10-0.15: Concerning")
+    print("  🔴 Gap > 0.15: Severe overfitting - model not reliable")
     
     return results_df
 
@@ -977,7 +1041,7 @@ def main():
         print("The analysis will proceed with diagnosis features only.")
     
     # Step 5: Prepare ML data
-    X, y, feature_names = prepare_ml_data(df_merged, sdoh_cols, include_diagnosis=True)
+    X, y, feature_names, class_mapping = prepare_ml_data(df_merged, sdoh_cols, include_diagnosis=True)
     
     if len(X) == 0 or len(feature_names) == 0:
         print("\n❌ ERROR: No valid features or samples for analysis.")
