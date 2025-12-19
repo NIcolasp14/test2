@@ -17,6 +17,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import re
+import os
+from pathlib import Path
 from collections import defaultdict
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold, cross_validate
@@ -61,6 +63,10 @@ except ImportError:
 ACXIOM_PATH = "full_acxiom.csv"
 DIAGNOSIS_PATH = "diagnosis.csv"
 OUTPUT_PATH = "diagnosis_prediction_results.csv"
+VIZ_FOLDER = "final_visualisations"
+
+# Create visualization folder
+Path(VIZ_FOLDER).mkdir(exist_ok=True)
 
 # Model parameters (aggressive regularization)
 RANDOM_STATE = 42
@@ -927,7 +933,7 @@ def plot_feature_importances(importance_df, top_n=20, filename='feature_importan
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"✅ Saved: {filename}")
-    plt.show()
+    plt.close()
 
 
 def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correlation_heatmap.png'):
@@ -943,9 +949,17 @@ def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correl
     
     # Create DataFrame with top features and target
     df_corr = X_raw[top_features].copy()
+    
+    # Impute NaNs for correlation calculation (use median, fast and safe)
+    print("   Imputing NaNs for correlation calculation...")
+    for col in df_corr.columns:
+        if df_corr[col].isna().any():
+            df_corr[col].fillna(df_corr[col].median(), inplace=True)
+    
     df_corr['diagnosis_label'] = y
     
     # Calculate correlation matrix
+    print("   Computing correlations...")
     corr_matrix = df_corr.corr()
     
     # Plot heatmap
@@ -960,7 +974,7 @@ def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correl
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"✅ Saved: {filename}")
-    plt.show()
+    plt.close()
     
     # Print correlations with target
     print(f"\n📊 Correlations with Diagnosis Label:")
@@ -1029,10 +1043,279 @@ def plot_model_comparison(final_results, filename='model_comparison.png'):
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"✅ Saved: {filename}")
-    plt.show()
+    plt.close()
 
 
-    return pd.DataFrame(results)
+# =============================================================================
+# Step 9: Refined Analysis with Top Features
+# =============================================================================
+
+def refined_analysis_top_features(X_raw, y, importance_df, best_model_name, 
+                                  top_n_features=20):
+    """
+    Rerun analysis using ONLY the top N most important features.
+    
+    Returns:
+        Refined results, pipeline, predictions, and feature list
+    """
+    print("\n" + "=" * 70)
+    print(f"REFINED ANALYSIS: Top {top_n_features} Features")
+    print("=" * 70)
+    
+    # Select top features
+    top_features = importance_df.head(top_n_features)['feature'].tolist()
+    X_refined = X_raw[top_features].copy()
+    
+    print(f"\n✅ Selected top {len(top_features)} features:")
+    for i, feat in enumerate(top_features[:10], 1):
+        imp = importance_df[importance_df['feature'] == feat]['importance'].values[0]
+        print(f"   {i}. {feat}: {imp:.4f}")
+    if len(top_features) > 10:
+        print(f"   ... and {len(top_features) - 10} more")
+    
+    # Create model pipeline
+    models = create_model_pipelines()
+    refined_pipeline = models[best_model_name]
+    
+    # Run CV
+    print(f"\n🔬 Running cross-validation with {best_model_name}...")
+    skf = StratifiedKFold(n_splits=N_CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    
+    scoring = {
+        'accuracy': 'accuracy',
+        'precision': 'precision',
+        'recall': 'recall',
+        'f1': 'f1',
+        'roc_auc': 'roc_auc'
+    }
+    
+    cv_results = cross_validate(
+        refined_pipeline, X_refined, y,
+        cv=skf,
+        scoring=scoring,
+        n_jobs=1,
+        return_train_score=True
+    )
+    
+    # Print results
+    print(f"\n📊 Refined Model Performance:")
+    print(f"   Accuracy: {cv_results['test_accuracy'].mean():.3f} ± {cv_results['test_accuracy'].std():.3f}")
+    print(f"   Precision: {cv_results['test_precision'].mean():.3f}")
+    print(f"   Recall: {cv_results['test_recall'].mean():.3f}")
+    print(f"   F1-Score: {cv_results['test_f1'].mean():.3f}")
+    print(f"   ROC-AUC: {cv_results['test_roc_auc'].mean():.3f}")
+    print(f"   Train Acc: {cv_results['train_accuracy'].mean():.3f}")
+    print(f"   Overfit Gap: {cv_results['train_accuracy'].mean() - cv_results['test_accuracy'].mean():.3f}")
+    
+    # Train final model on all data
+    print(f"\n🎯 Training final refined model...")
+    refined_pipeline.fit(X_refined, y)
+    
+    # Get predictions
+    y_pred = refined_pipeline.predict(X_refined)
+    y_pred_proba = refined_pipeline.predict_proba(X_refined)[:, 1]
+    
+    # Save results
+    refined_results = {
+        'n_features': len(top_features),
+        'model': best_model_name,
+        'accuracy': cv_results['test_accuracy'].mean(),
+        'precision': cv_results['test_precision'].mean(),
+        'recall': cv_results['test_recall'].mean(),
+        'f1': cv_results['test_f1'].mean(),
+        'roc_auc': cv_results['test_roc_auc'].mean(),
+        'overfit_gap': cv_results['train_accuracy'].mean() - cv_results['test_accuracy'].mean()
+    }
+    
+    return refined_results, refined_pipeline, X_refined, y_pred, y_pred_proba, top_features
+
+
+def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba, 
+                                   top_features, refined_pipeline):
+    """
+    Create comprehensive visualizations for refined model.
+    """
+    print("\n" + "=" * 70)
+    print("Creating Advanced Visualizations")
+    print("=" * 70)
+    
+    # 1. Refined Feature Importances
+    print("\n📊 1. Refined feature importances...")
+    trained_model = refined_pipeline.named_steps['model']
+    
+    if hasattr(trained_model, 'feature_importances_'):
+        dropper = refined_pipeline.named_steps['dropper']
+        kept_features = dropper.cols_to_keep_
+        
+        refined_imp_df = pd.DataFrame({
+            'feature': kept_features,
+            'importance': trained_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        plt.figure(figsize=(10, 8))
+        plt.barh(range(len(refined_imp_df)), refined_imp_df['importance'], color='coral')
+        plt.yticks(range(len(refined_imp_df)), refined_imp_df['feature'])
+        plt.xlabel('Importance', fontsize=12)
+        plt.title('Refined Model: Feature Importances', fontsize=14, fontweight='bold')
+        plt.gca().invert_yaxis()
+        plt.tight_layout()
+        plt.savefig(f'{VIZ_FOLDER}/1_refined_feature_importance.png', dpi=300, bbox_inches='tight')
+        print(f"   ✅ Saved: {VIZ_FOLDER}/1_refined_feature_importance.png")
+        plt.close()
+    
+    # 2. Prediction Analysis
+    print("\n📊 2. Prediction distribution and confusion matrix...")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Predicted probabilities by true class
+    ax1 = axes[0]
+    for label in [0, 1]:
+        probs = y_pred_proba[y == label]
+        ax1.hist(probs, bins=30, alpha=0.6, label=f'True Class {label}', density=True)
+    ax1.set_xlabel('Predicted Probability', fontsize=12)
+    ax1.set_ylabel('Density', fontsize=12)
+    ax1.set_title('Prediction Distribution by True Class', fontsize=13, fontweight='bold')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+    
+    # Confusion matrix
+    ax2 = axes[1]
+    cm = confusion_matrix(y, y_pred)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax2, cbar=False)
+    ax2.set_xlabel('Predicted', fontsize=12)
+    ax2.set_ylabel('True', fontsize=12)
+    ax2.set_title('Confusion Matrix', fontsize=13, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig(f'{VIZ_FOLDER}/2_prediction_analysis.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {VIZ_FOLDER}/2_prediction_analysis.png")
+    plt.close()
+    
+    # 3. Feature Distributions by Class
+    print("\n📊 3. Feature distributions by diagnosis class...")
+    n_features_to_plot = min(9, len(kept_features))
+    n_cols = 3
+    n_rows = (n_features_to_plot + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 4*n_rows))
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    axes = axes.flatten()
+    
+    for idx, feat in enumerate(kept_features[:n_features_to_plot]):
+        ax = axes[idx]
+        
+        # Get feature values (impute for visualization)
+        feat_vals = X_refined[feat].fillna(X_refined[feat].median())
+        
+        for label in [0, 1]:
+            vals = feat_vals[y == label]
+            ax.hist(vals, bins=20, alpha=0.6, label=f'Diagnosis {label}', density=True)
+        
+        ax.set_xlabel(feat, fontsize=10)
+        ax.set_ylabel('Density', fontsize=10)
+        ax.set_title(f'{feat}', fontsize=11, fontweight='bold')
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+    
+    # Hide empty subplots
+    for idx in range(n_features_to_plot, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(f'{VIZ_FOLDER}/3_feature_distributions.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {VIZ_FOLDER}/3_feature_distributions.png")
+    plt.close()
+    
+    # 4. Calibration Analysis
+    print("\n📊 4. Model calibration and confidence analysis...")
+    
+    # Bin predictions by confidence
+    bins = np.linspace(0, 1, 11)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    bin_accuracies = []
+    bin_counts = []
+    
+    for i in range(len(bins) - 1):
+        mask = (y_pred_proba >= bins[i]) & (y_pred_proba < bins[i+1])
+        if mask.sum() > 0:
+            bin_acc = (y_pred[mask] == y[mask]).mean()
+            bin_accuracies.append(bin_acc)
+            bin_counts.append(mask.sum())
+        else:
+            bin_accuracies.append(np.nan)
+            bin_counts.append(0)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Calibration curve
+    ax1 = axes[0]
+    ax1.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration', linewidth=2)
+    ax1.plot(bin_centers, bin_accuracies, 'o-', color='coral', 
+             label='Model', linewidth=2, markersize=8)
+    ax1.set_xlabel('Mean Predicted Probability', fontsize=12)
+    ax1.set_ylabel('Fraction of Positives', fontsize=12)
+    ax1.set_title('Calibration Curve', fontsize=13, fontweight='bold')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+    ax1.set_xlim([0, 1])
+    ax1.set_ylim([0, 1])
+    
+    # Sample distribution
+    ax2 = axes[1]
+    ax2.bar(bin_centers, bin_counts, width=0.08, color='steelblue', alpha=0.7)
+    ax2.set_xlabel('Predicted Probability', fontsize=12)
+    ax2.set_ylabel('Number of Samples', fontsize=12)
+    ax2.set_title('Prediction Confidence Distribution', fontsize=13, fontweight='bold')
+    ax2.grid(alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(f'{VIZ_FOLDER}/4_calibration_analysis.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {VIZ_FOLDER}/4_calibration_analysis.png")
+    plt.close()
+    
+    # 5. Performance Metrics Summary
+    print("\n📊 5. Performance metrics summary...")
+    
+    from sklearn.metrics import precision_recall_curve, roc_curve, auc
+    
+    # Precision-Recall curve
+    precision, recall, _ = precision_recall_curve(y, y_pred_proba)
+    pr_auc = auc(recall, precision)
+    
+    # ROC curve
+    fpr, tpr, _ = roc_curve(y, y_pred_proba)
+    roc_auc = auc(fpr, tpr)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Precision-Recall
+    ax1 = axes[0]
+    ax1.plot(recall, precision, color='darkorange', linewidth=2, 
+             label=f'PR curve (AUC = {pr_auc:.3f})')
+    ax1.set_xlabel('Recall', fontsize=12)
+    ax1.set_ylabel('Precision', fontsize=12)
+    ax1.set_title('Precision-Recall Curve', fontsize=13, fontweight='bold')
+    ax1.legend(loc='best')
+    ax1.grid(alpha=0.3)
+    
+    # ROC
+    ax2 = axes[1]
+    ax2.plot(fpr, tpr, color='darkorange', linewidth=2, 
+             label=f'ROC curve (AUC = {roc_auc:.3f})')
+    ax2.plot([0, 1], [0, 1], 'k--', linewidth=2, label='Random')
+    ax2.set_xlabel('False Positive Rate', fontsize=12)
+    ax2.set_ylabel('True Positive Rate', fontsize=12)
+    ax2.set_title('ROC Curve', fontsize=13, fontweight='bold')
+    ax2.legend(loc='best')
+    ax2.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{VIZ_FOLDER}/5_performance_curves.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {VIZ_FOLDER}/5_performance_curves.png")
+    plt.close()
+    
+    print("\n✅ All advanced visualizations complete!")
 
 
 # =============================================================================
@@ -1168,22 +1451,88 @@ def main():
     # Extract feature importances
     importance_df = extract_feature_importances(X_raw, y_best, X_raw.columns.tolist(), best_pipeline)
     
-    # Visualizations
+    # Initial visualizations (saved to viz folder)
     if importance_df is not None:
-        plot_feature_importances(importance_df, top_n=20)
-        plot_correlation_heatmap(X_raw, y_best, importance_df, top_n=20)
+        plot_feature_importances(importance_df, top_n=30, 
+                                filename=f'{VIZ_FOLDER}/initial_feature_importances.png')
+        plot_correlation_heatmap(X_raw, y_best, importance_df, top_n=20,
+                                filename=f'{VIZ_FOLDER}/initial_correlation_heatmap.png')
     
     # Model comparison plot
-    plot_model_comparison(final_results)
+    plot_model_comparison(final_results, filename=f'{VIZ_FOLDER}/model_comparison.png')
+    
+    # Step 8: Refined Analysis with Top Features
+    print("\n" + "=" * 70)
+    print("Step 8: REFINED ANALYSIS - Top Features Only")
+    print("=" * 70)
+    
+    if importance_df is not None:
+        # Run refined analysis with top 20 features
+        refined_results, refined_pipeline, X_refined, y_pred, y_pred_proba, top_features = \
+            refined_analysis_top_features(
+                X_raw, y_best, importance_df, best_model_name, 
+                top_n_features=20
+            )
+        
+        # Create all advanced visualizations
+        create_advanced_visualizations(
+            X_refined, y_best, y_pred, y_pred_proba, 
+            top_features, refined_pipeline
+        )
+        
+        # Save refined results
+        refined_df = pd.DataFrame([refined_results])
+        refined_df.to_csv(f'{VIZ_FOLDER}/refined_model_results.csv', index=False)
+        print(f"\n✅ Saved refined results to: {VIZ_FOLDER}/refined_model_results.csv")
+        
+        # Comparison
+        print("\n" + "=" * 70)
+        print("COMPARISON: All Features vs Top Features")
+        print("=" * 70)
+        print(f"\nOriginal Model (all {X_raw.shape[1]} features):")
+        print(f"   Model: {overall_best['Model']}")
+        print(f"   F1-Score: {overall_best['F1']:.3f}")
+        print(f"   ROC-AUC: {overall_best['ROC_AUC']:.3f}")
+        print(f"   Overfit Gap: {overall_best['Overfit_Gap']:.3f}")
+        
+        print(f"\nRefined Model (top {refined_results['n_features']} features):")
+        print(f"   Model: {refined_results['model']}")
+        print(f"   F1-Score: {refined_results['f1']:.3f}")
+        print(f"   ROC-AUC: {refined_results['roc_auc']:.3f}")
+        print(f"   Overfit Gap: {refined_results['overfit_gap']:.3f}")
+        
+        f1_change = refined_results['f1'] - overall_best['F1']
+        gap_change = refined_results['overfit_gap'] - overall_best['Overfit_Gap']
+        
+        print(f"\n📊 Changes:")
+        print(f"   F1-Score: {f1_change:+.3f}")
+        print(f"   Overfit Gap: {gap_change:+.3f}")
+        
+        if f1_change > 0 and gap_change < 0:
+            print(f"\n✅ Refined model: Better performance AND less overfitting!")
+        elif gap_change < -0.02:
+            print(f"\n✅ Refined model: Significantly better generalization!")
+        elif abs(f1_change) < 0.02:
+            print(f"\n📊 Similar performance, but refined model is more interpretable!")
+        else:
+            print(f"\n📊 Trade-off between performance and interpretability")
     
     print("\n" + "=" * 70)
-    print("✅ ANALYSIS COMPLETE")
+    print("✅ COMPLETE ANALYSIS FINISHED")
     print("=" * 70)
     print(f"\n📁 Output Files:")
+    print(f"\n   Main Results:")
     print(f"   - {OUTPUT_PATH}")
-    print(f"   - feature_importances.png")
-    print(f"   - correlation_heatmap.png")
+    print(f"\n   Visualizations Folder: {VIZ_FOLDER}/")
+    print(f"   - initial_feature_importances.png")
+    print(f"   - initial_correlation_heatmap.png")
     print(f"   - model_comparison.png")
+    print(f"   - 1_refined_feature_importance.png")
+    print(f"   - 2_prediction_analysis.png")
+    print(f"   - 3_feature_distributions.png")
+    print(f"   - 4_calibration_analysis.png")
+    print(f"   - 5_performance_curves.png")
+    print(f"   - refined_model_results.csv")
     
     print("\n" + "=" * 70)
 
