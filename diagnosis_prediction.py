@@ -1095,6 +1095,196 @@ def refined_analysis_top_features(X_raw, y, importance_df, best_model_name,
     return refined_results, refined_pipeline, X_refined, y_pred, y_pred_proba, top_features
 
 
+def create_model_comparison_for_diagnosis(results_df, diagnosis_code, viz_folder):
+    """
+    Create visualization comparing all models for a single diagnosis.
+    """
+    print(f"\n📊 Creating model comparison for {diagnosis_code}...")
+    
+    # Sort by F1 score
+    results_sorted = results_df.sort_values('F1', ascending=False)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    models = results_sorted['Model'].values
+    n_models = len(models)
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, n_models))
+    
+    # 1. F1-Score comparison
+    ax1 = axes[0, 0]
+    bars1 = ax1.barh(range(n_models), results_sorted['F1'], color=colors)
+    ax1.set_yticks(range(n_models))
+    ax1.set_yticklabels(models)
+    ax1.set_xlabel('F1-Score', fontsize=11)
+    ax1.set_title(f'F1-Score by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    # Add values on bars
+    for i, (bar, val) in enumerate(zip(bars1, results_sorted['F1'])):
+        ax1.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
+    
+    # 2. ROC-AUC comparison
+    ax2 = axes[0, 1]
+    bars2 = ax2.barh(range(n_models), results_sorted['ROC_AUC'], color=colors)
+    ax2.set_yticks(range(n_models))
+    ax2.set_yticklabels(models)
+    ax2.set_xlabel('ROC-AUC', fontsize=11)
+    ax2.set_title(f'ROC-AUC by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax2.grid(axis='x', alpha=0.3)
+    ax2.invert_yaxis()
+    for i, (bar, val) in enumerate(zip(bars2, results_sorted['ROC_AUC'])):
+        ax2.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
+    
+    # 3. Accuracy with error bars
+    ax3 = axes[1, 0]
+    bars3 = ax3.barh(range(n_models), results_sorted['Accuracy'], 
+                     xerr=results_sorted['Accuracy_Std'], color=colors, capsize=5)
+    ax3.set_yticks(range(n_models))
+    ax3.set_yticklabels(models)
+    ax3.set_xlabel('Accuracy ± Std', fontsize=11)
+    ax3.set_title(f'Accuracy by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax3.grid(axis='x', alpha=0.3)
+    ax3.invert_yaxis()
+    
+    # 4. Overfitting analysis
+    ax4 = axes[1, 1]
+    gap_colors = ['red' if gap > 0.1 else 'orange' if gap > 0.05 else 'green' 
+                  for gap in results_sorted['Overfit_Gap']]
+    bars4 = ax4.barh(range(n_models), results_sorted['Overfit_Gap'], color=gap_colors, alpha=0.7)
+    ax4.set_yticks(range(n_models))
+    ax4.set_yticklabels(models)
+    ax4.set_xlabel('Overfit Gap (Train - Test)', fontsize=11)
+    ax4.set_title(f'Generalization by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax4.axvline(x=0.05, color='orange', linestyle='--', alpha=0.5, linewidth=2, label='Warning')
+    ax4.axvline(x=0.1, color='red', linestyle='--', alpha=0.5, linewidth=2, label='High')
+    ax4.grid(axis='x', alpha=0.3)
+    ax4.legend(loc='best', fontsize=9)
+    ax4.invert_yaxis()
+    
+    plt.tight_layout()
+    plt.savefig(f'{viz_folder}/0_all_models_comparison.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/0_all_models_comparison.png")
+    plt.close()
+
+
+def create_best_model_summary(results_df, diagnosis_code, viz_folder):
+    """
+    Create dedicated visualization for the best performing model.
+    """
+    print(f"\n📊 Creating best model summary for {diagnosis_code}...")
+    
+    # Get best model
+    best = results_df.sort_values('F1', ascending=False).iloc[0]
+    
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    
+    # Title
+    fig.suptitle(f'Best Model Performance: {best["Model"]}\nDiagnosis: {diagnosis_code}', 
+                 fontsize=16, fontweight='bold', y=0.98)
+    
+    # 1. Performance metrics (large, top-left)
+    ax1 = fig.add_subplot(gs[0:2, 0])
+    metrics = ['Accuracy', 'Precision', 'Recall', 'F1', 'ROC_AUC']
+    values = [best['Accuracy'], best['Precision'], best['Recall'], best['F1'], best['ROC_AUC']]
+    colors_metrics = ['#3498db', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6']
+    
+    bars = ax1.barh(metrics, values, color=colors_metrics, alpha=0.8)
+    ax1.set_xlim([0, 1])
+    ax1.set_xlabel('Score', fontsize=11, fontweight='bold')
+    ax1.set_title('Performance Metrics', fontsize=12, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    
+    # Add value labels
+    for bar, val in zip(bars, values):
+        ax1.text(val + 0.02, bar.get_y() + bar.get_height()/2, 
+                f'{val:.3f}', va='center', fontsize=11, fontweight='bold')
+    
+    # 2. Train vs Test Accuracy (top-middle)
+    ax2 = fig.add_subplot(gs[0, 1])
+    train_test = ['Train', 'Test']
+    accuracies = [best['Train_Acc'], best['Accuracy']]
+    colors_tt = ['#3498db', '#e67e22']
+    bars2 = ax2.bar(train_test, accuracies, color=colors_tt, alpha=0.8)
+    ax2.set_ylim([0, 1])
+    ax2.set_ylabel('Accuracy', fontsize=10, fontweight='bold')
+    ax2.set_title('Train vs Test', fontsize=11, fontweight='bold')
+    ax2.grid(axis='y', alpha=0.3)
+    
+    for bar, val in zip(bars2, accuracies):
+        ax2.text(bar.get_x() + bar.get_width()/2, val + 0.02, 
+                f'{val:.3f}', ha='center', fontsize=10, fontweight='bold')
+    
+    # 3. Overfitting gauge (top-right)
+    ax3 = fig.add_subplot(gs[0, 2])
+    gap = best['Overfit_Gap']
+    gap_color = 'green' if gap < 0.05 else 'orange' if gap < 0.1 else 'red'
+    gap_label = 'Excellent' if gap < 0.05 else 'Good' if gap < 0.1 else 'High'
+    
+    ax3.barh([0], [gap], color=gap_color, alpha=0.7, height=0.5)
+    ax3.set_xlim([0, max(0.15, gap * 1.2)])
+    ax3.set_ylim([-0.5, 0.5])
+    ax3.set_xlabel('Overfit Gap', fontsize=10, fontweight='bold')
+    ax3.set_title('Generalization', fontsize=11, fontweight='bold')
+    ax3.set_yticks([])
+    ax3.axvline(x=0.05, color='orange', linestyle='--', alpha=0.5, linewidth=2)
+    ax3.axvline(x=0.1, color='red', linestyle='--', alpha=0.5, linewidth=2)
+    ax3.text(gap + 0.005, 0, f'{gap:.3f}\n({gap_label})', 
+            va='center', fontsize=10, fontweight='bold')
+    ax3.grid(axis='x', alpha=0.3)
+    
+    # 4. Model info box (middle)
+    ax4 = fig.add_subplot(gs[1, 1:])
+    ax4.axis('off')
+    
+    info_text = f"""
+    Model: {best['Model']}
+    
+    Key Metrics:
+    • F1-Score: {best['F1']:.3f}
+    • ROC-AUC: {best['ROC_AUC']:.3f}
+    • Precision: {best['Precision']:.3f}
+    • Recall: {best['Recall']:.3f}
+    
+    Generalization:
+    • Train Accuracy: {best['Train_Acc']:.3f}
+    • Test Accuracy: {best['Accuracy']:.3f} ± {best['Accuracy_Std']:.3f}
+    • Overfit Gap: {best['Overfit_Gap']:.3f}
+    
+    Status: {gap_label} generalization
+    """
+    
+    ax4.text(0.1, 0.5, info_text, fontsize=11, family='monospace',
+            verticalalignment='center', bbox=dict(boxstyle='round', 
+            facecolor='wheat', alpha=0.3))
+    
+    # 5. Metrics comparison radar/bar (bottom)
+    ax5 = fig.add_subplot(gs[2, :])
+    
+    all_metrics = ['Accuracy', 'Precision', 'Recall', 'F1', 'ROC_AUC']
+    all_values = [best['Accuracy'], best['Precision'], best['Recall'], 
+                  best['F1'], best['ROC_AUC']]
+    
+    x_pos = np.arange(len(all_metrics))
+    bars5 = ax5.bar(x_pos, all_values, color=colors_metrics, alpha=0.8, width=0.6)
+    ax5.set_xticks(x_pos)
+    ax5.set_xticklabels(all_metrics, fontsize=11, fontweight='bold')
+    ax5.set_ylim([0, 1])
+    ax5.set_ylabel('Score', fontsize=11, fontweight='bold')
+    ax5.set_title('Complete Performance Profile', fontsize=12, fontweight='bold')
+    ax5.grid(axis='y', alpha=0.3)
+    ax5.axhline(y=0.7, color='orange', linestyle='--', alpha=0.3, linewidth=1.5)
+    ax5.axhline(y=0.8, color='green', linestyle='--', alpha=0.3, linewidth=1.5)
+    
+    for bar, val in zip(bars5, all_values):
+        ax5.text(bar.get_x() + bar.get_width()/2, val + 0.02, 
+                f'{val:.3f}', ha='center', fontsize=10, fontweight='bold')
+    
+    plt.savefig(f'{viz_folder}/0_best_model_summary.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/0_best_model_summary.png")
+    plt.close()
+
+
 def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba, 
                                    top_features, refined_pipeline, viz_folder):
     """
@@ -1362,7 +1552,7 @@ def create_comparative_analysis(all_diagnosis_results, all_refined_results):
     plt.close()
     
     # 2. Refined model comparison
-    if not all_refined_results.empty:
+    if len(all_refined_results) > 0:
         print("\n📊 2. Creating refined model comparison...")
         
         refined_df = pd.DataFrame(all_refined_results)
@@ -1509,6 +1699,11 @@ def main():
             print(f"\n✅ Best model: {best['Model']}")
             print(f"   F1: {best['F1']:.3f}, ROC-AUC: {best['ROC_AUC']:.3f}, Gap: {best['Overfit_Gap']:.3f}")
             
+            # Create visualizations comparing all models and highlighting best
+            Path(viz_folder).mkdir(parents=True, exist_ok=True)
+            create_model_comparison_for_diagnosis(results_df, dx_code, viz_folder)
+            create_best_model_summary(results_df, dx_code, viz_folder)
+            
             # Step 7: Feature importance and refined analysis for this diagnosis
             best_model_name = best['Model']
             best_pipeline = models[best_model_name]
@@ -1574,6 +1769,8 @@ def main():
         print(f"   - 2_refined_comparison.png")
         print(f"   - summary_statistics.csv")
         print(f"\n   Each diagnosis folder contains:")
+        print(f"   - 0_all_models_comparison.png (NEW!)")
+        print(f"   - 0_best_model_summary.png (NEW!)")
         print(f"   - initial_feature_importances.png")
         print(f"   - initial_correlation_heatmap.png")
         print(f"   - 1_refined_feature_importance.png")
