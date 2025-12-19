@@ -63,15 +63,23 @@ except ImportError:
 ACXIOM_PATH = "full_acxiom.csv"
 DIAGNOSIS_PATH = "diagnosis.csv"
 OUTPUT_PATH = "diagnosis_prediction_results.csv"
-VIZ_FOLDER = "final_visualisations"
+BASE_VIZ_FOLDER = "all_visualisations"
+COMPARATIVE_FOLDER = "comparative_visualisations"
 
-# Create visualization folder
-Path(VIZ_FOLDER).mkdir(exist_ok=True)
+# Create base folders
+Path(BASE_VIZ_FOLDER).mkdir(exist_ok=True)
+Path(COMPARATIVE_FOLDER).mkdir(exist_ok=True)
+
+# Target diagnosis codes (from user's list)
+TARGET_DIAGNOSES = [
+    'I10', 'E78.5', 'Z23', 'Z00.00', 'E78.2', 'Z12.11', 'Z79.899', 'Z13.31',
+    'K21.9', 'Z12.31', 'Z01.30', 'Z13.89', 'M25.13', 'M52.4', 'Z73.0',
+    'Z13.9', 'T91.81', 'E78.00', 'Z87.891', 'E55.9'
+]
 
 # Model parameters (aggressive regularization)
 RANDOM_STATE = 42
 N_CV_FOLDS = 5
-N_COMBINATIONS = 10  # Number of diagnosis combinations to test
 
 RF_PARAMS = {
     'n_estimators': 50,
@@ -568,99 +576,55 @@ def extract_diagnosis_codes(diagnosis_df):
 
 
 # =============================================================================
-# Step 3: Create Balanced Diagnosis Combinations
+# Step 3: Validate Target Diagnoses
 # =============================================================================
 
-def create_balanced_combinations(patient_diagnoses, diagnosis_prevalence, 
-                                n_combinations=10, target_prevalence=0.5, 
-                                min_prevalence=0.4, max_prevalence=0.6):
+def validate_target_diagnoses(diagnosis_prevalence, target_diagnoses, total_patients):
     """
-    Create N random combinations of diagnoses that result in balanced labels.
-    
-    Args:
-        patient_diagnoses: dict {patient_id: set(diagnosis_codes)}
-        diagnosis_prevalence: Series with diagnosis counts
-        n_combinations: Number of combinations to create
-        target_prevalence: Target prevalence (0.5 = 50%)
-        min_prevalence: Minimum acceptable prevalence
-        max_prevalence: Maximum acceptable prevalence
+    Validate which target diagnoses are available in the dataset.
     
     Returns:
-        List of diagnosis combinations (each is a set of diagnosis codes)
+        List of valid diagnosis codes with their prevalence info
     """
     print("\n" + "=" * 70)
-    print("Step 3: Creating Balanced Diagnosis Combinations")
+    print("Step 3: Validating Target Diagnosis Codes")
     print("=" * 70)
     
-    total_patients = len(patient_diagnoses)
-    target_count = int(total_patients * target_prevalence)
+    valid_diagnoses = []
     
-    print(f"\nTarget: {target_count} patients ({target_prevalence*100:.0f}%) per combination")
-    print(f"Acceptable range: {int(total_patients*min_prevalence)}-{int(total_patients*max_prevalence)} patients")
+    print(f"\nChecking {len(target_diagnoses)} target diagnoses...")
     
-    # Filter to diagnoses with reasonable prevalence (5-40%)
-    min_patients = int(total_patients * 0.05)
-    max_patients = int(total_patients * 0.40)
+    for dx_code in target_diagnoses:
+        if dx_code in diagnosis_prevalence.index:
+            count = diagnosis_prevalence[dx_code]
+            prevalence = count / total_patients
+            valid_diagnoses.append({
+                'code': dx_code,
+                'count': count,
+                'prevalence': prevalence
+            })
+            print(f"  ✓ {dx_code}: {count} patients ({prevalence*100:.1f}%)")
+        else:
+            print(f"  ✗ {dx_code}: Not found in dataset")
     
-    candidate_dx = diagnosis_prevalence[
-        (diagnosis_prevalence >= min_patients) & 
-        (diagnosis_prevalence <= max_patients)
-    ]
+    print(f"\n✅ Found {len(valid_diagnoses)}/{len(target_diagnoses)} target diagnoses in dataset")
     
-    print(f"\nCandidate diagnoses (5-40% prevalence): {len(candidate_dx)}")
+    if len(valid_diagnoses) == 0:
+        print("\n⚠️ WARNING: No target diagnoses found!")
+        print("Available diagnosis codes (top 20):")
+        for dx, count in diagnosis_prevalence.head(20).items():
+            print(f"   {dx}: {count} patients")
     
-    if len(candidate_dx) < 5:
-        print("⚠️ Too few candidate diagnoses, loosening criteria...")
-        candidate_dx = diagnosis_prevalence.head(50)
-    
-    combinations = []
-    attempts = 0
-    max_attempts = n_combinations * 100
-    
-    np.random.seed(RANDOM_STATE)
-    
-    while len(combinations) < n_combinations and attempts < max_attempts:
-        attempts += 1
-        
-        # Randomly select 2-6 diagnoses
-        n_dx = np.random.randint(2, 7)
-        selected_dx = set(np.random.choice(candidate_dx.index, size=min(n_dx, len(candidate_dx)), 
-                                          replace=False))
-        
-        # Count patients with ANY of these diagnoses
-        count = sum(1 for pt_dx in patient_diagnoses.values() 
-                   if len(pt_dx.intersection(selected_dx)) > 0)
-        
-        prevalence = count / total_patients
-        
-        # Check if prevalence is in acceptable range
-        if min_prevalence <= prevalence <= max_prevalence:
-            # Check this combination isn't too similar to existing ones
-            is_unique = True
-            for existing_combo in combinations:
-                overlap = len(selected_dx.intersection(existing_combo))
-                if overlap / len(selected_dx) > 0.7:  # >70% overlap
-                    is_unique = False
-                    break
-            
-            if is_unique:
-                combinations.append(selected_dx)
-                print(f"\n✓ Combination {len(combinations)}: {count} patients ({prevalence*100:.1f}%)")
-                print(f"  Diagnoses: {list(selected_dx)}")
-    
-    if len(combinations) < n_combinations:
-        print(f"\n⚠️ Only found {len(combinations)} combinations (wanted {n_combinations})")
-    
-    return combinations
+    return valid_diagnoses
 
 
 # =============================================================================
-# Step 4: Create Labels for Each Combination
+# Step 4: Create Labels for Single Diagnosis
 # =============================================================================
 
-def create_labels_for_combination(patient_ids, patient_diagnoses, diagnosis_combination):
+def create_labels_for_diagnosis(patient_ids, patient_diagnoses, diagnosis_code):
     """
-    Create binary labels: 1 if patient has ANY diagnosis from combination, 0 otherwise.
+    Create binary labels: 1 if patient has the specific diagnosis, 0 otherwise.
     
     Returns:
         labels: Series with patient_id as index
@@ -668,7 +632,7 @@ def create_labels_for_combination(patient_ids, patient_diagnoses, diagnosis_comb
     labels = {}
     for patient_id in patient_ids:
         patient_dx = patient_diagnoses.get(patient_id, set())
-        has_diagnosis = len(patient_dx.intersection(diagnosis_combination)) > 0
+        has_diagnosis = diagnosis_code in patient_dx
         labels[patient_id] = 1 if has_diagnosis else 0
     
     return pd.Series(labels)
@@ -813,12 +777,12 @@ def create_model_pipelines():
 
 
 # =============================================================================
-# Step 7: Evaluate Each Combination
+# Step 7: Evaluate Single Diagnosis
 # =============================================================================
 
-def evaluate_combination(X_raw, y, combination_name, models):
+def evaluate_diagnosis(X_raw, y, diagnosis_code, models):
     """
-    Run leakage-free CV for one diagnosis combination.
+    Run leakage-free CV for one diagnosis code.
     
     Returns:
         DataFrame with results for each model
@@ -847,7 +811,7 @@ def evaluate_combination(X_raw, y, combination_name, models):
             )
             
             result = {
-                'Combination': combination_name,
+                'Diagnosis': diagnosis_code,
                 'Model': model_name,
                 'Accuracy': cv_results['test_accuracy'].mean(),
                 'Accuracy_Std': cv_results['test_accuracy'].std(),
@@ -1051,7 +1015,7 @@ def plot_model_comparison(final_results, filename='model_comparison.png'):
 # =============================================================================
 
 def refined_analysis_top_features(X_raw, y, importance_df, best_model_name, 
-                                  top_n_features=20):
+                                  top_n_features=20, diagnosis_code=""):
     """
     Rerun analysis using ONLY the top N most important features.
     
@@ -1059,7 +1023,7 @@ def refined_analysis_top_features(X_raw, y, importance_df, best_model_name,
         Refined results, pipeline, predictions, and feature list
     """
     print("\n" + "=" * 70)
-    print(f"REFINED ANALYSIS: Top {top_n_features} Features")
+    print(f"REFINED ANALYSIS: Top {top_n_features} Features ({diagnosis_code})")
     print("=" * 70)
     
     # Select top features
@@ -1117,6 +1081,7 @@ def refined_analysis_top_features(X_raw, y, importance_df, best_model_name,
     
     # Save results
     refined_results = {
+        'diagnosis': diagnosis_code,
         'n_features': len(top_features),
         'model': best_model_name,
         'accuracy': cv_results['test_accuracy'].mean(),
@@ -1131,13 +1096,16 @@ def refined_analysis_top_features(X_raw, y, importance_df, best_model_name,
 
 
 def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba, 
-                                   top_features, refined_pipeline):
+                                   top_features, refined_pipeline, viz_folder):
     """
     Create comprehensive visualizations for refined model.
     """
     print("\n" + "=" * 70)
     print("Creating Advanced Visualizations")
     print("=" * 70)
+    
+    # Ensure viz folder exists
+    Path(viz_folder).mkdir(parents=True, exist_ok=True)
     
     # 1. Refined Feature Importances
     print("\n📊 1. Refined feature importances...")
@@ -1159,8 +1127,8 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
         plt.title('Refined Model: Feature Importances', fontsize=14, fontweight='bold')
         plt.gca().invert_yaxis()
         plt.tight_layout()
-        plt.savefig(f'{VIZ_FOLDER}/1_refined_feature_importance.png', dpi=300, bbox_inches='tight')
-        print(f"   ✅ Saved: {VIZ_FOLDER}/1_refined_feature_importance.png")
+        plt.savefig(f'{viz_folder}/1_refined_feature_importance.png', dpi=300, bbox_inches='tight')
+        print(f"   ✅ Saved: {viz_folder}/1_refined_feature_importance.png")
         plt.close()
     
     # 2. Prediction Analysis
@@ -1187,8 +1155,8 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
     ax2.set_title('Confusion Matrix', fontsize=13, fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig(f'{VIZ_FOLDER}/2_prediction_analysis.png', dpi=300, bbox_inches='tight')
-    print(f"   ✅ Saved: {VIZ_FOLDER}/2_prediction_analysis.png")
+    plt.savefig(f'{viz_folder}/2_prediction_analysis.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/2_prediction_analysis.png")
     plt.close()
     
     # 3. Feature Distributions by Class
@@ -1223,8 +1191,8 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
         axes[idx].axis('off')
     
     plt.tight_layout()
-    plt.savefig(f'{VIZ_FOLDER}/3_feature_distributions.png', dpi=300, bbox_inches='tight')
-    print(f"   ✅ Saved: {VIZ_FOLDER}/3_feature_distributions.png")
+    plt.savefig(f'{viz_folder}/3_feature_distributions.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/3_feature_distributions.png")
     plt.close()
     
     # 4. Calibration Analysis
@@ -1270,8 +1238,8 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
     ax2.grid(alpha=0.3, axis='y')
     
     plt.tight_layout()
-    plt.savefig(f'{VIZ_FOLDER}/4_calibration_analysis.png', dpi=300, bbox_inches='tight')
-    print(f"   ✅ Saved: {VIZ_FOLDER}/4_calibration_analysis.png")
+    plt.savefig(f'{viz_folder}/4_calibration_analysis.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/4_calibration_analysis.png")
     plt.close()
     
     # 5. Performance Metrics Summary
@@ -1311,11 +1279,154 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
     ax2.grid(alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(f'{VIZ_FOLDER}/5_performance_curves.png', dpi=300, bbox_inches='tight')
-    print(f"   ✅ Saved: {VIZ_FOLDER}/5_performance_curves.png")
+    plt.savefig(f'{viz_folder}/5_performance_curves.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/5_performance_curves.png")
     plt.close()
     
     print("\n✅ All advanced visualizations complete!")
+
+
+# =============================================================================
+# Step 10: Comparative Analysis Across All Diagnoses
+# =============================================================================
+
+def create_comparative_analysis(all_diagnosis_results, all_refined_results):
+    """
+    Create comparative visualizations across all diagnoses.
+    """
+    print("\n" + "=" * 70)
+    print("COMPARATIVE ANALYSIS ACROSS ALL DIAGNOSES")
+    print("=" * 70)
+    
+    # 1. Performance comparison across diagnoses
+    print("\n📊 1. Creating performance comparison...")
+    
+    # Get best model per diagnosis
+    best_per_dx = all_diagnosis_results.loc[
+        all_diagnosis_results.groupby('Diagnosis')['F1'].idxmax()
+    ]
+    
+    best_per_dx = best_per_dx.sort_values('F1', ascending=False)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # F1 scores
+    ax1 = axes[0, 0]
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(best_per_dx)))
+    ax1.barh(range(len(best_per_dx)), best_per_dx['F1'], color=colors)
+    ax1.set_yticks(range(len(best_per_dx)))
+    ax1.set_yticklabels(best_per_dx['Diagnosis'])
+    ax1.set_xlabel('F1-Score', fontsize=12)
+    ax1.set_title('F1-Score by Diagnosis Code', fontsize=13, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    
+    # ROC-AUC scores
+    ax2 = axes[0, 1]
+    ax2.barh(range(len(best_per_dx)), best_per_dx['ROC_AUC'], color=colors)
+    ax2.set_yticks(range(len(best_per_dx)))
+    ax2.set_yticklabels(best_per_dx['Diagnosis'])
+    ax2.set_xlabel('ROC-AUC', fontsize=12)
+    ax2.set_title('ROC-AUC by Diagnosis Code', fontsize=13, fontweight='bold')
+    ax2.grid(axis='x', alpha=0.3)
+    ax2.invert_yaxis()
+    
+    # Overfit gaps
+    ax3 = axes[1, 0]
+    gap_colors = ['red' if gap > 0.1 else 'orange' if gap > 0.05 else 'green' 
+                  for gap in best_per_dx['Overfit_Gap']]
+    ax3.barh(range(len(best_per_dx)), best_per_dx['Overfit_Gap'], color=gap_colors, alpha=0.7)
+    ax3.set_yticks(range(len(best_per_dx)))
+    ax3.set_yticklabels(best_per_dx['Diagnosis'])
+    ax3.set_xlabel('Overfit Gap (Train - Test)', fontsize=12)
+    ax3.set_title('Overfitting by Diagnosis', fontsize=13, fontweight='bold')
+    ax3.axvline(x=0.05, color='orange', linestyle='--', alpha=0.5, label='Warning (0.05)')
+    ax3.axvline(x=0.1, color='red', linestyle='--', alpha=0.5, label='High (0.1)')
+    ax3.grid(axis='x', alpha=0.3)
+    ax3.legend()
+    ax3.invert_yaxis()
+    
+    # Model selection frequency
+    ax4 = axes[1, 1]
+    model_counts = best_per_dx['Model'].value_counts()
+    ax4.bar(range(len(model_counts)), model_counts.values, color='steelblue', alpha=0.7)
+    ax4.set_xticks(range(len(model_counts)))
+    ax4.set_xticklabels(model_counts.index, rotation=45, ha='right')
+    ax4.set_ylabel('Number of Diagnoses', fontsize=12)
+    ax4.set_title('Best Model Selection Frequency', fontsize=13, fontweight='bold')
+    ax4.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{COMPARATIVE_FOLDER}/1_performance_comparison.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {COMPARATIVE_FOLDER}/1_performance_comparison.png")
+    plt.close()
+    
+    # 2. Refined model comparison
+    if not all_refined_results.empty:
+        print("\n📊 2. Creating refined model comparison...")
+        
+        refined_df = pd.DataFrame(all_refined_results)
+        refined_df = refined_df.sort_values('f1', ascending=False)
+        
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Performance comparison
+        ax1 = axes[0]
+        x = np.arange(len(refined_df))
+        width = 0.35
+        ax1.bar(x - width/2, refined_df['f1'], width, label='F1-Score', alpha=0.8, color='coral')
+        ax1.bar(x + width/2, refined_df['roc_auc'], width, label='ROC-AUC', alpha=0.8, color='steelblue')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(refined_df['diagnosis'], rotation=45, ha='right')
+        ax1.set_ylabel('Score', fontsize=12)
+        ax1.set_title('Refined Model Performance (Top 20 Features)', fontsize=13, fontweight='bold')
+        ax1.legend()
+        ax1.grid(axis='y', alpha=0.3)
+        
+        # Feature count vs performance
+        ax2 = axes[1]
+        scatter = ax2.scatter(refined_df['overfit_gap'], refined_df['f1'], 
+                             s=100, c=refined_df['f1'], cmap='viridis', alpha=0.6)
+        for idx, row in refined_df.iterrows():
+            ax2.annotate(row['diagnosis'], (row['overfit_gap'], row['f1']),
+                        fontsize=8, alpha=0.7)
+        ax2.set_xlabel('Overfit Gap', fontsize=12)
+        ax2.set_ylabel('F1-Score', fontsize=12)
+        ax2.set_title('Performance vs Generalization', fontsize=13, fontweight='bold')
+        ax2.grid(alpha=0.3)
+        plt.colorbar(scatter, ax=ax2, label='F1-Score')
+        
+        plt.tight_layout()
+        plt.savefig(f'{COMPARATIVE_FOLDER}/2_refined_comparison.png', dpi=300, bbox_inches='tight')
+        print(f"   ✅ Saved: {COMPARATIVE_FOLDER}/2_refined_comparison.png")
+        plt.close()
+    
+    # 3. Summary statistics table
+    print("\n📊 3. Creating summary table...")
+    
+    summary = best_per_dx[['Diagnosis', 'Model', 'F1', 'ROC_AUC', 'Accuracy', 'Overfit_Gap']].copy()
+    summary = summary.round(3)
+    summary.to_csv(f'{COMPARATIVE_FOLDER}/summary_statistics.csv', index=False)
+    print(f"   ✅ Saved: {COMPARATIVE_FOLDER}/summary_statistics.csv")
+    
+    # 4. Print summary
+    print("\n" + "=" * 70)
+    print("SUMMARY STATISTICS")
+    print("=" * 70)
+    print(f"\nBest performing diagnoses (by F1-score):")
+    for idx, row in best_per_dx.head(5).iterrows():
+        print(f"  {row['Diagnosis']}: F1={row['F1']:.3f}, AUC={row['ROC_AUC']:.3f}, Model={row['Model']}")
+    
+    print(f"\nMost challenging diagnoses (by F1-score):")
+    for idx, row in best_per_dx.tail(5).iterrows():
+        print(f"  {row['Diagnosis']}: F1={row['F1']:.3f}, AUC={row['ROC_AUC']:.3f}, Model={row['Model']}")
+    
+    print(f"\nAverage metrics across all diagnoses:")
+    print(f"  F1-Score: {best_per_dx['F1'].mean():.3f} ± {best_per_dx['F1'].std():.3f}")
+    print(f"  ROC-AUC: {best_per_dx['ROC_AUC'].mean():.3f} ± {best_per_dx['ROC_AUC'].std():.3f}")
+    print(f"  Overfit Gap: {best_per_dx['Overfit_Gap'].mean():.3f} ± {best_per_dx['Overfit_Gap'].std():.3f}")
+    
+    print("\n✅ Comparative analysis complete!")
 
 
 # =============================================================================
@@ -1324,8 +1435,8 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
 
 def main():
     print("\n" + "=" * 70)
-    print("DIAGNOSIS PREDICTION FROM SDoH FEATURES")
-    print("Balanced, Leakage-Free Analysis")
+    print("INDIVIDUAL DIAGNOSIS PREDICTION FROM SDoH FEATURES")
+    print("Leakage-Free Analysis with Comparative Study")
     print("=" * 70)
     
     # Step 1: Load and link datasets
@@ -1334,14 +1445,12 @@ def main():
     # Step 2: Extract diagnoses
     patient_diagnoses, diagnosis_prevalence = extract_diagnosis_codes(diagnosis_df)
     
-    # Step 3: Create balanced combinations
-    combinations = create_balanced_combinations(
-        patient_diagnoses, diagnosis_prevalence,
-        n_combinations=N_COMBINATIONS
-    )
+    # Step 3: Validate target diagnoses
+    total_patients = len(patient_diagnoses)
+    valid_diagnoses = validate_target_diagnoses(diagnosis_prevalence, TARGET_DIAGNOSES, total_patients)
     
-    if len(combinations) == 0:
-        print("\n❌ No balanced combinations found!")
+    if len(valid_diagnoses) == 0:
+        print("\n❌ No valid diagnoses found!")
         return
     
     # Step 4: Prepare features
@@ -1358,30 +1467,40 @@ def main():
     models = create_model_pipelines()
     print(f"\n✅ Created {len(models)} model pipelines")
     
-    # Step 6: Evaluate each combination
+    # Step 6: Evaluate each diagnosis
     print("\n" + "=" * 70)
-    print(f"Step 6: Evaluating {len(combinations)} Diagnosis Combinations")
+    print(f"Step 6: Evaluating {len(valid_diagnoses)} Individual Diagnoses")
     print("=" * 70)
     
     all_results = []
+    all_refined_results = []
     
-    for i, combination in enumerate(combinations, 1):
-        combo_name = f"Combo_{i}"
+    for i, dx_info in enumerate(valid_diagnoses, 1):
+        dx_code = dx_info['code']
+        dx_safe = dx_code.replace('.', '_')  # Safe folder name
+        viz_folder = f"{BASE_VIZ_FOLDER}/visualisations_{dx_safe}"
+        
         print(f"\n{'='*70}")
-        print(f"🔬 Testing Combination {i}/{len(combinations)}")
+        print(f"🔬 Analyzing Diagnosis {i}/{len(valid_diagnoses)}: {dx_code}")
         print(f"{'='*70}")
-        print(f"Diagnoses: {list(combination)}")
+        print(f"Patients: {dx_info['count']} ({dx_info['prevalence']*100:.1f}%)")
         
         # Create labels
-        y = create_labels_for_combination(X_raw.index, patient_diagnoses, combination)
+        y = create_labels_for_diagnosis(X_raw.index, patient_diagnoses, dx_code)
         y = y.reindex(X_raw.index, fill_value=0)
         
         print(f"\nLabel distribution:")
-        print(f"  Positive (has diagnosis): {(y==1).sum()} ({(y==1).mean()*100:.1f}%)")
-        print(f"  Negative (no diagnosis): {(y==0).sum()} ({(y==0).mean()*100:.1f}%)")
+        print(f"  Positive (has {dx_code}): {(y==1).sum()} ({(y==1).mean()*100:.1f}%)")
+        print(f"  Negative (no {dx_code}): {(y==0).sum()} ({(y==0).mean()*100:.1f}%)")
+        
+        # Skip if too imbalanced
+        prevalence = (y==1).mean()
+        if prevalence < 0.05 or prevalence > 0.95:
+            print(f"\n⚠️ Skipping {dx_code}: Too imbalanced ({prevalence*100:.1f}%)")
+            continue
         
         # Evaluate
-        results_df = evaluate_combination(X_raw, y, combo_name, models)
+        results_df = evaluate_diagnosis(X_raw, y, dx_code, models)
         all_results.append(results_df)
         
         # Print summary
@@ -1389,150 +1508,88 @@ def main():
             best = results_df.sort_values('F1', ascending=False).iloc[0]
             print(f"\n✅ Best model: {best['Model']}")
             print(f"   F1: {best['F1']:.3f}, ROC-AUC: {best['ROC_AUC']:.3f}, Gap: {best['Overfit_Gap']:.3f}")
+            
+            # Step 7: Feature importance and refined analysis for this diagnosis
+            best_model_name = best['Model']
+            best_pipeline = models[best_model_name]
+            
+            # Extract feature importances
+            importance_df = extract_feature_importances(X_raw, y, X_raw.columns.tolist(), best_pipeline)
+            
+            if importance_df is not None:
+                # Save visualizations for this diagnosis
+                Path(viz_folder).mkdir(parents=True, exist_ok=True)
+                
+                plot_feature_importances(importance_df, top_n=30, 
+                                        filename=f'{viz_folder}/initial_feature_importances.png')
+                plot_correlation_heatmap(X_raw, y, importance_df, top_n=20,
+                                        filename=f'{viz_folder}/initial_correlation_heatmap.png')
+                
+                # Refined analysis with top 20 features
+                refined_results, refined_pipeline, X_refined, y_pred, y_pred_proba, top_features = \
+                    refined_analysis_top_features(
+                        X_raw, y, importance_df, best_model_name, 
+                        top_n_features=20, diagnosis_code=dx_code
+                    )
+                
+                # Create advanced visualizations
+                create_advanced_visualizations(
+                    X_refined, y, y_pred, y_pred_proba, 
+                    top_features, refined_pipeline, viz_folder
+                )
+                
+                # Save refined results
+                refined_df = pd.DataFrame([refined_results])
+                refined_df.to_csv(f'{viz_folder}/refined_model_results.csv', index=False)
+                all_refined_results.append(refined_results)
+                
+                print(f"\n✅ Saved all visualizations to: {viz_folder}/")
     
     # Combine all results
-    final_results = pd.concat(all_results, ignore_index=True)
-    
-    # Save results
-    final_results.to_csv(OUTPUT_PATH, index=False)
-    print(f"\n✅ Saved results to: {OUTPUT_PATH}")
-    
-    # Summary
-    print("\n" + "=" * 70)
-    print("SUMMARY: Best Results per Combination")
-    print("=" * 70)
-    
-    for combo in final_results['Combination'].unique():
-        combo_results = final_results[final_results['Combination'] == combo]
-        best = combo_results.sort_values('F1', ascending=False).iloc[0]
+    if len(all_results) > 0:
+        final_results = pd.concat(all_results, ignore_index=True)
+        final_results.to_csv(OUTPUT_PATH, index=False)
+        print(f"\n✅ Saved all results to: {OUTPUT_PATH}")
         
-        print(f"\n{combo}:")
-        print(f"  Best Model: {best['Model']}")
-        print(f"  Accuracy: {best['Accuracy']:.3f} ± {best['Accuracy_Std']:.3f}")
-        print(f"  F1-Score: {best['F1']:.3f}")
-        print(f"  ROC-AUC: {best['ROC_AUC']:.3f}")
-        print(f"  Overfit Gap: {best['Overfit_Gap']:.3f}")
-        
-        if best['Overfit_Gap'] < 0.05:
-            print(f"  ✅ Excellent generalization")
-        elif best['Overfit_Gap'] < 0.10:
-            print(f"  ⚡ Good generalization")
-        else:
-            print(f"  ⚠️ Some overfitting")
-    
-    # Overall best
-    overall_best = final_results.sort_values('F1', ascending=False).iloc[0]
-    print(f"\n🏆 Overall Best Performance:")
-    print(f"   Combination: {overall_best['Combination']}")
-    print(f"   Model: {overall_best['Model']}")
-    print(f"   F1-Score: {overall_best['F1']:.3f}")
-    print(f"   ROC-AUC: {overall_best['ROC_AUC']:.3f}")
-    
-    # Step 7: Extract feature importances for best combination
-    print("\n" + "=" * 70)
-    print("Step 7: Feature Importance Analysis")
-    print("=" * 70)
-    
-    best_combo_idx = int(overall_best['Combination'].split('_')[1]) - 1
-    best_combo = combinations[best_combo_idx]
-    best_model_name = overall_best['Model']
-    
-    print(f"\nAnalyzing best combination: {overall_best['Combination']}")
-    print(f"Diagnoses: {list(best_combo)}")
-    print(f"Best model: {best_model_name}")
-    
-    # Create labels for best combination
-    y_best = create_labels_for_combination(X_raw.index, patient_diagnoses, best_combo)
-    y_best = y_best.reindex(X_raw.index, fill_value=0)
-    
-    # Get the best model pipeline
-    best_pipeline = models[best_model_name]
-    
-    # Extract feature importances
-    importance_df = extract_feature_importances(X_raw, y_best, X_raw.columns.tolist(), best_pipeline)
-    
-    # Initial visualizations (saved to viz folder)
-    if importance_df is not None:
-        plot_feature_importances(importance_df, top_n=30, 
-                                filename=f'{VIZ_FOLDER}/initial_feature_importances.png')
-        plot_correlation_heatmap(X_raw, y_best, importance_df, top_n=20,
-                                filename=f'{VIZ_FOLDER}/initial_correlation_heatmap.png')
-    
-    # Model comparison plot
-    plot_model_comparison(final_results, filename=f'{VIZ_FOLDER}/model_comparison.png')
-    
-    # Step 8: Refined Analysis with Top Features
-    print("\n" + "=" * 70)
-    print("Step 8: REFINED ANALYSIS - Top Features Only")
-    print("=" * 70)
-    
-    if importance_df is not None:
-        # Run refined analysis with top 20 features
-        refined_results, refined_pipeline, X_refined, y_pred, y_pred_proba, top_features = \
-            refined_analysis_top_features(
-                X_raw, y_best, importance_df, best_model_name, 
-                top_n_features=20
-            )
-        
-        # Create all advanced visualizations
-        create_advanced_visualizations(
-            X_refined, y_best, y_pred, y_pred_proba, 
-            top_features, refined_pipeline
-        )
-        
-        # Save refined results
-        refined_df = pd.DataFrame([refined_results])
-        refined_df.to_csv(f'{VIZ_FOLDER}/refined_model_results.csv', index=False)
-        print(f"\n✅ Saved refined results to: {VIZ_FOLDER}/refined_model_results.csv")
-        
-        # Comparison
+        # Step 8: Comparative Analysis
         print("\n" + "=" * 70)
-        print("COMPARISON: All Features vs Top Features")
+        print("Step 8: COMPARATIVE ANALYSIS")
         print("=" * 70)
-        print(f"\nOriginal Model (all {X_raw.shape[1]} features):")
-        print(f"   Model: {overall_best['Model']}")
-        print(f"   F1-Score: {overall_best['F1']:.3f}")
-        print(f"   ROC-AUC: {overall_best['ROC_AUC']:.3f}")
-        print(f"   Overfit Gap: {overall_best['Overfit_Gap']:.3f}")
         
-        print(f"\nRefined Model (top {refined_results['n_features']} features):")
-        print(f"   Model: {refined_results['model']}")
-        print(f"   F1-Score: {refined_results['f1']:.3f}")
-        print(f"   ROC-AUC: {refined_results['roc_auc']:.3f}")
-        print(f"   Overfit Gap: {refined_results['overfit_gap']:.3f}")
+        create_comparative_analysis(final_results, all_refined_results)
         
-        f1_change = refined_results['f1'] - overall_best['F1']
-        gap_change = refined_results['overfit_gap'] - overall_best['Overfit_Gap']
+        # Final Summary
+        print("\n" + "=" * 70)
+        print("✅ COMPLETE ANALYSIS FINISHED")
+        print("=" * 70)
+        print(f"\n📁 Output Structure:")
+        print(f"\n   Main Results:")
+        print(f"   - {OUTPUT_PATH}")
+        print(f"\n   Individual Diagnosis Folders: {BASE_VIZ_FOLDER}/")
+        print(f"   - visualisations_I10/")
+        print(f"   - visualisations_E78_5/")
+        print(f"   - ... (one folder per diagnosis)")
+        print(f"\n   Comparative Analysis: {COMPARATIVE_FOLDER}/")
+        print(f"   - 1_performance_comparison.png")
+        print(f"   - 2_refined_comparison.png")
+        print(f"   - summary_statistics.csv")
+        print(f"\n   Each diagnosis folder contains:")
+        print(f"   - initial_feature_importances.png")
+        print(f"   - initial_correlation_heatmap.png")
+        print(f"   - 1_refined_feature_importance.png")
+        print(f"   - 2_prediction_analysis.png")
+        print(f"   - 3_feature_distributions.png")
+        print(f"   - 4_calibration_analysis.png")
+        print(f"   - 5_performance_curves.png")
+        print(f"   - refined_model_results.csv")
         
-        print(f"\n📊 Changes:")
-        print(f"   F1-Score: {f1_change:+.3f}")
-        print(f"   Overfit Gap: {gap_change:+.3f}")
-        
-        if f1_change > 0 and gap_change < 0:
-            print(f"\n✅ Refined model: Better performance AND less overfitting!")
-        elif gap_change < -0.02:
-            print(f"\n✅ Refined model: Significantly better generalization!")
-        elif abs(f1_change) < 0.02:
-            print(f"\n📊 Similar performance, but refined model is more interpretable!")
-        else:
-            print(f"\n📊 Trade-off between performance and interpretability")
-    
-    print("\n" + "=" * 70)
-    print("✅ COMPLETE ANALYSIS FINISHED")
-    print("=" * 70)
-    print(f"\n📁 Output Files:")
-    print(f"\n   Main Results:")
-    print(f"   - {OUTPUT_PATH}")
-    print(f"\n   Visualizations Folder: {VIZ_FOLDER}/")
-    print(f"   - initial_feature_importances.png")
-    print(f"   - initial_correlation_heatmap.png")
-    print(f"   - model_comparison.png")
-    print(f"   - 1_refined_feature_importance.png")
-    print(f"   - 2_prediction_analysis.png")
-    print(f"   - 3_feature_distributions.png")
-    print(f"   - 4_calibration_analysis.png")
-    print(f"   - 5_performance_curves.png")
-    print(f"   - refined_model_results.csv")
+        print("\n" + "=" * 70)
+        print(f"✨ Analyzed {len(valid_diagnoses)} diagnoses")
+        print(f"✨ Created {len(valid_diagnoses)} individual visualization folders")
+        print(f"✨ Generated comparative analysis across all diagnoses")
+        print("=" * 70)
+    else:
+        print("\n❌ No diagnoses were successfully analyzed!")
     
     print("\n" + "=" * 70)
 
