@@ -703,89 +703,186 @@ def prepare_features(acxiom_df):
 
 
 # =============================================================================
-# Step 6: Create Leakage-Free Model Pipelines
+# Step 6: Create Leakage-Free Model Pipelines with Hyperparameter Variations
 # =============================================================================
 
 def create_model_pipelines():
-    """Create pipelines with all preprocessing inside."""
+    """
+    Create pipelines with 2-3 hyperparameter configurations per model.
+    This provides alternatives in case one configuration fails or predicts one class.
+    """
     models = {}
     
-    print("🔒 Creating leakage-free pipelines...")
+    print("🔒 Creating leakage-free pipelines with hyperparameter variations...")
     print("   All preprocessing happens INSIDE cross-validation folds")
+    print("   Multiple configs per model for robustness")
     
-    models['Random Forest'] = Pipeline([
-        ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-        ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-        ('scaler', StandardScaler()),
-        ('model', RandomForestClassifier(**RF_PARAMS))
-    ])
+    # Random Forest - 3 configurations
+    rf_configs = [
+        ('Conservative', {'max_depth': 4, 'min_samples_leaf': 15, 'max_features': 'sqrt', 'n_estimators': 100}),
+        ('Moderate', {'max_depth': 6, 'min_samples_leaf': 10, 'max_features': 'sqrt', 'n_estimators': 100}),
+        ('Relaxed', {'max_depth': 8, 'min_samples_leaf': 5, 'max_features': 'sqrt', 'n_estimators': 100}),
+    ]
+    for name, config in rf_configs:
+        params = {
+            'random_state': RANDOM_STATE, 'n_jobs': -1, 'class_weight': 'balanced',
+            **config
+        }
+        models[f'RF-{name}'] = Pipeline([
+            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
+            ('scaler', StandardScaler()),
+            ('model', RandomForestClassifier(**params))
+        ])
     
-    models['Gradient Boosting'] = Pipeline([
-        ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-        ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-        ('scaler', StandardScaler()),
-        ('model', GradientBoostingClassifier(**GB_PARAMS))
-    ])
+    # Gradient Boosting - 3 configurations
+    gb_configs = [
+        ('Conservative', {'max_depth': 3, 'learning_rate': 0.01, 'min_samples_leaf': 20, 'subsample': 0.7, 'n_estimators': 100}),
+        ('Moderate', {'max_depth': 4, 'learning_rate': 0.02, 'min_samples_leaf': 10, 'subsample': 0.8, 'n_estimators': 100}),
+        ('Relaxed', {'max_depth': 5, 'learning_rate': 0.03, 'min_samples_leaf': 5, 'subsample': 0.8, 'n_estimators': 100}),
+    ]
+    for name, config in gb_configs:
+        params = {
+            'random_state': RANDOM_STATE, 'validation_fraction': 0.1, 
+            'n_iter_no_change': 10, 'tol': 1e-4,
+            **config
+        }
+        models[f'GB-{name}'] = Pipeline([
+            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
+            ('scaler', StandardScaler()),
+            ('model', GradientBoostingClassifier(**params))
+        ])
     
+    # LightGBM - 3 configurations
     if LIGHTGBM_AVAILABLE:
-        lgbm_params = {
-            'n_estimators': 50, 'max_depth': 4, 'learning_rate': 0.01,
-            'num_leaves': 15, 'min_child_samples': 30, 'subsample': 0.7,
-            'colsample_bytree': 0.7, 'reg_alpha': 0.1, 'reg_lambda': 1.0,
-            'random_state': RANDOM_STATE, 'n_jobs': -1, 'verbosity': -1, 
-            'class_weight': 'balanced'
-        }
-        models['LightGBM'] = Pipeline([
-            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-            ('scaler', StandardScaler()),
-            ('model', lgb.LGBMClassifier(**lgbm_params))
-        ])
+        lgbm_configs = [
+            ('Conservative', {'max_depth': 3, 'learning_rate': 0.01, 'num_leaves': 15, 'min_child_samples': 30, 
+                            'subsample': 0.7, 'n_estimators': 100}),
+            ('Moderate', {'max_depth': 4, 'learning_rate': 0.02, 'num_leaves': 20, 'min_child_samples': 20, 
+                         'subsample': 0.8, 'n_estimators': 100}),
+            ('Relaxed', {'max_depth': 5, 'learning_rate': 0.03, 'num_leaves': 25, 'min_child_samples': 15, 
+                        'subsample': 0.8, 'n_estimators': 100}),
+        ]
+        for name, config in lgbm_configs:
+            params = {
+                'colsample_bytree': 0.7, 'reg_alpha': 0.1, 'reg_lambda': 1.0,
+                'random_state': RANDOM_STATE, 'n_jobs': -1, 'verbosity': -1, 
+                'class_weight': 'balanced',
+                **config
+            }
+            models[f'LGBM-{name}'] = Pipeline([
+                ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+                ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
+                ('scaler', StandardScaler()),
+                ('model', lgb.LGBMClassifier(**params))
+            ])
     
+    # XGBoost - 3 configurations
     if XGBOOST_AVAILABLE:
-        xgb_params = {
-            'n_estimators': 50, 'max_depth': 3, 'learning_rate': 0.01,
-            'min_child_weight': 10, 'subsample': 0.7, 'colsample_bytree': 0.7,
-            'gamma': 0.2, 'reg_alpha': 0.1, 'reg_lambda': 1.5,
-            'random_state': RANDOM_STATE, 'n_jobs': -1, 'eval_metric': 'logloss'
-        }
-        models['XGBoost'] = Pipeline([
-            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-            ('scaler', StandardScaler()),
-            ('model', xgb.XGBClassifier(**xgb_params))
-        ])
+        xgb_configs = [
+            ('Conservative', {'max_depth': 3, 'learning_rate': 0.01, 'min_child_weight': 15, 'subsample': 0.7, 
+                            'gamma': 0.3, 'n_estimators': 100}),
+            ('Moderate', {'max_depth': 4, 'learning_rate': 0.02, 'min_child_weight': 10, 'subsample': 0.8, 
+                         'gamma': 0.2, 'n_estimators': 100}),
+            ('Relaxed', {'max_depth': 5, 'learning_rate': 0.03, 'min_child_weight': 5, 'subsample': 0.8, 
+                        'gamma': 0.1, 'n_estimators': 100}),
+        ]
+        for name, config in xgb_configs:
+            params = {
+                'colsample_bytree': 0.7, 'reg_alpha': 0.1, 'reg_lambda': 1.5,
+                'random_state': RANDOM_STATE, 'n_jobs': -1, 'eval_metric': 'logloss',
+                **config
+            }
+            models[f'XGB-{name}'] = Pipeline([
+                ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+                ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
+                ('scaler', StandardScaler()),
+                ('model', xgb.XGBClassifier(**params))
+            ])
     
+    # CatBoost - 2 configurations (slower to train)
     if CATBOOST_AVAILABLE:
-        catboost_params = {
-            'iterations': 50, 'depth': 4, 'learning_rate': 0.01,
-            'l2_leaf_reg': 5, 'random_state': RANDOM_STATE,
-            'verbose': False, 'thread_count': -1,
-            'auto_class_weights': 'Balanced',
-            'min_data_in_leaf': 10, 'max_leaves': 16, 'subsample': 0.7
-        }
-        models['CatBoost'] = Pipeline([
-            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-            ('scaler', StandardScaler()),
-            ('model', CatBoostClassifier(**catboost_params))
-        ])
+        catboost_configs = [
+            ('Conservative', {'depth': 4, 'learning_rate': 0.01, 'min_data_in_leaf': 20, 'l2_leaf_reg': 5, 
+                            'subsample': 0.7, 'iterations': 100}),
+            ('Moderate', {'depth': 5, 'learning_rate': 0.02, 'min_data_in_leaf': 10, 'l2_leaf_reg': 3, 
+                         'subsample': 0.8, 'iterations': 100}),
+        ]
+        for name, config in catboost_configs:
+            params = {
+                'random_state': RANDOM_STATE, 'verbose': False, 'thread_count': -1,
+                'auto_class_weights': 'Balanced', 'max_leaves': 16,
+                **config
+            }
+            models[f'CatBoost-{name}'] = Pipeline([
+                ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+                ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
+                ('scaler', StandardScaler()),
+                ('model', CatBoostClassifier(**params))
+            ])
     
-    print(f"✅ Created {len(models)} model pipelines")
+    print(f"✅ Created {len(models)} model pipeline variations")
+    model_counts = {}
+    for model_name in models.keys():
+        base_name = model_name.split('-')[0]
+        model_counts[base_name] = model_counts.get(base_name, 0) + 1
+    
+    count_str = ', '.join([f'{k}: {v}' for k, v in model_counts.items()])
+    print(f"   Configs per model: {count_str}")
     
     return models
 
 
 # =============================================================================
-# Step 7: Evaluate Single Diagnosis
+# Step 7: Evaluate Single Diagnosis with Quality Filters
 # =============================================================================
+
+def detect_single_class_predictions(pipeline, X_raw, y, cv_folds=3):
+    """
+    Check if a model predicts only one class across CV folds (class collapse).
+    
+    Returns:
+        True if model predicts multiple classes, False if single-class only
+    """
+    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+    
+    unique_predictions_per_fold = []
+    
+    for train_idx, test_idx in skf.split(X_raw, y):
+        X_train, X_test = X_raw.iloc[train_idx], X_raw.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        
+        # Fit and predict
+        try:
+            pipeline.fit(X_train, y_train)
+            y_pred = pipeline.predict(X_test)
+            
+            # Count unique predictions
+            unique_predictions_per_fold.append(len(np.unique(y_pred)))
+        except Exception as e:
+            # If prediction fails, consider it a failure
+            return False
+    
+    # Check if any fold predicted only one class
+    single_class_folds = [n for n in unique_predictions_per_fold if n == 1]
+    
+    if len(single_class_folds) > 0:
+        return False  # Model collapsed to single class
+    return True  # Model predicts multiple classes
+
 
 def evaluate_diagnosis(X_raw, y, diagnosis_code, models):
     """
-    Run leakage-free CV for one diagnosis code.
+    Run leakage-free CV for one diagnosis code with quality filters.
+    
+    Filters out models that:
+    - Predict only one class (class collapse)
+    - Overfit excessively (gap > 0.20)
+    - Perform too poorly (F1 < 0.48)
     
     Returns:
-        DataFrame with results for each model
+        DataFrame with results for each valid model
     """
     skf = StratifiedKFold(n_splits=N_CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     
@@ -799,8 +896,19 @@ def evaluate_diagnosis(X_raw, y, diagnosis_code, models):
     
     results = []
     
+    print(f"\n🔍 Evaluating {len(models)} model configurations...")
+    
     for model_name, pipeline in models.items():
         try:
+            # Step 1: Check for single-class predictions (quick test)
+            print(f"   Testing {model_name}...", end=" ", flush=True)
+            predicts_multiple_classes = detect_single_class_predictions(pipeline, X_raw, y, cv_folds=3)
+            
+            if not predicts_multiple_classes:
+                print("❌ REJECTED: Predicts only one class (class collapse)")
+                continue
+            
+            # Step 2: Run full cross-validation
             cv_results = cross_validate(
                 pipeline, X_raw, y,
                 cv=skf,
@@ -810,6 +918,24 @@ def evaluate_diagnosis(X_raw, y, diagnosis_code, models):
                 error_score='raise'
             )
             
+            # Calculate metrics
+            f1_score_val = cv_results['test_f1'].mean()
+            overfit_gap = cv_results['train_accuracy'].mean() - cv_results['test_accuracy'].mean()
+            
+            # Step 3: Quality filters
+            rejection_reasons = []
+            
+            if f1_score_val < 0.48:
+                rejection_reasons.append(f"Low F1={f1_score_val:.3f}")
+            
+            if overfit_gap > 0.20:
+                rejection_reasons.append(f"Excessive overfit gap={overfit_gap:.3f}")
+            
+            if rejection_reasons:
+                print(f"❌ REJECTED: {', '.join(rejection_reasons)}")
+                continue
+            
+            # Step 4: Model passed all checks
             result = {
                 'Diagnosis': diagnosis_code,
                 'Model': model_name,
@@ -817,17 +943,29 @@ def evaluate_diagnosis(X_raw, y, diagnosis_code, models):
                 'Accuracy_Std': cv_results['test_accuracy'].std(),
                 'Precision': cv_results['test_precision'].mean(),
                 'Recall': cv_results['test_recall'].mean(),
-                'F1': cv_results['test_f1'].mean(),
+                'F1': f1_score_val,
                 'ROC_AUC': cv_results['test_roc_auc'].mean(),
                 'Train_Acc': cv_results['train_accuracy'].mean(),
-                'Overfit_Gap': cv_results['train_accuracy'].mean() - cv_results['test_accuracy'].mean()
+                'Overfit_Gap': overfit_gap
             }
             results.append(result)
+            
+            # Quality indicator
+            quality = "🟢" if overfit_gap < 0.05 else "🟡" if overfit_gap < 0.10 else "🟠"
+            print(f"{quality} ACCEPTED: F1={f1_score_val:.3f}, Gap={overfit_gap:.3f}")
             
         except Exception as e:
             print(f"  ❌ {model_name} failed: {str(e)}")
     
-    return pd.DataFrame(results)
+    results_df = pd.DataFrame(results)
+    
+    if results_df.empty:
+        print("\n⚠️ WARNING: All models were rejected or failed!")
+        print("   Consider relaxing hyperparameters or checking data quality")
+    else:
+        print(f"\n✅ {len(results_df)}/{len(models)} models passed quality checks")
+    
+    return results_df
 
 
 # =============================================================================
@@ -903,15 +1041,21 @@ def plot_feature_importances(importance_df, top_n=20, filename='feature_importan
 def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correlation_heatmap.png'):
     """
     Plot correlation heatmap for top features.
+    
+    NOTE: 'diagnosis_label' is added ONLY for visualization purposes in this function.
+    It is NOT part of the feature set used for model training. The label is added
+    temporarily to this separate dataframe (df_corr) to compute and visualize
+    correlations between features and the target.
     """
     if importance_df is None:
         return
     
     print(f"\n📊 Creating correlation heatmap...")
+    print("   ℹ️  Note: 'diagnosis_label' used ONLY for correlation visualization (NOT in training)")
     
     top_features = importance_df.head(top_n)['feature'].tolist()
     
-    # Create DataFrame with top features and target
+    # Create SEPARATE DataFrame for correlation visualization (NOT used in training!)
     df_corr = X_raw[top_features].copy()
     
     # Impute NaNs for correlation calculation (use median, fast and safe)
@@ -920,6 +1064,7 @@ def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correl
         if df_corr[col].isna().any():
             df_corr[col].fillna(df_corr[col].median(), inplace=True)
     
+    # Add label ONLY to this temporary visualization dataframe
     df_corr['diagnosis_label'] = y
     
     # Calculate correlation matrix
@@ -931,7 +1076,7 @@ def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correl
     sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm', 
                 center=0, square=True, linewidths=0.5, cbar_kws={"shrink": 0.8},
                 vmin=-1, vmax=1)
-    plt.title(f'Correlation Heatmap: Top {top_n} Features vs Diagnosis', 
+    plt.title(f'Correlation Heatmap: Top {top_n} Features vs Diagnosis\n(diagnosis_label shown for visualization only)', 
               fontsize=14, fontweight='bold', pad=20)
     plt.xticks(rotation=45, ha='right')
     plt.yticks(rotation=0)
@@ -941,9 +1086,12 @@ def plot_correlation_heatmap(X_raw, y, importance_df, top_n=20, filename='correl
     plt.close()
     
     # Print correlations with target
-    print(f"\n📊 Correlations with Diagnosis Label:")
+    print(f"\n📊 Correlations with Diagnosis Label (visualization only):")
     target_corr = corr_matrix['diagnosis_label'].drop('diagnosis_label').sort_values(ascending=False)
     print(target_corr.to_string())
+    
+    # Clean up - remove the temporary visualization dataframe
+    del df_corr
 
 
 def plot_model_comparison(final_results, filename='model_comparison.png'):
@@ -1650,12 +1798,11 @@ def main():
     X_raw['patient_id'] = acxiom_df['patient_id']
     X_raw = X_raw.set_index('patient_id')
     
-    # Step 5: Create models
+    # Step 5: Create models with hyperparameter variations
     print("\n" + "=" * 70)
-    print("Step 5: Creating Leakage-Free Model Pipelines")
+    print("Step 5: Creating Leakage-Free Model Pipelines with Variations")
     print("=" * 70)
     models = create_model_pipelines()
-    print(f"\n✅ Created {len(models)} model pipelines")
     
     # Step 6: Evaluate each diagnosis
     print("\n" + "=" * 70)
