@@ -654,9 +654,14 @@ def prepare_features(acxiom_df):
     print("Step 4: Preparing SDoH Features (NO LEAKAGE)")
     print("=" * 70)
     
-    # Identify SDoH columns (pattern: 2 letters + numbers, or ibe*)
-    pattern = re.compile(r'^[a-z]{2}\d+|^ibe\d+', re.IGNORECASE)
+    # Identify SDoH columns (pattern: 2-4 letters + numbers, or ibe*)
+    # Examples: ab123, xyz45, demo1234, ibe789
+    pattern = re.compile(r'^[a-z]{2,4}\d+|^ibe\d+', re.IGNORECASE)
     sdoh_cols = [col for col in acxiom_df.columns if pattern.match(col)]
+    
+    print(f"\n🔍 Detected {len(sdoh_cols)} potential SDoH columns")
+    print(f"   Pattern: 2-4 letters followed by numbers (e.g., ab123, xyz45, demo1234)")
+    print(f"   Examples found: {sdoh_cols[:15]}")
 
     # Exclude any columns that look like diagnosis/claim fields to avoid leakage
     exclusion_tokens = ['diag', 'icd', 'dx', 'diagnosis', 'claim', 'clm', 'disease',
@@ -667,8 +672,8 @@ def prepare_features(acxiom_df):
         print(f"   Examples excluded: {excluded[:10]}")
     sdoh_cols = [c for c in sdoh_cols if c not in excluded]
 
-    print(f"\n✅ Found {len(sdoh_cols)} SDoH columns (after exclusion)")
-    print(f"   Examples: {sdoh_cols[:10]}")
+    print(f"\n✅ Found {len(sdoh_cols)} valid SDoH columns (after exclusion)")
+    print(f"   Final examples: {sdoh_cols[:15]}")
     
     if len(sdoh_cols) == 0:
         print("\n⚠️ No SDoH columns found, using all non-ID columns")
