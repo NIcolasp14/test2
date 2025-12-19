@@ -21,7 +21,7 @@ from collections import defaultdict
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import KNNImputer
+from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import (
@@ -126,6 +126,165 @@ class ColumnDropper(BaseEstimator, TransformerMixin):
         return df[self.cols_to_keep_].values
 
 
+class ConditionalImputer(BaseEstimator, TransformerMixin):
+    """Choose KNNImputer for small feature sets, otherwise SimpleImputer.
+
+    This avoids the O(n_samples^2 * n_features) cost of KNNImputer on
+    high-dimensional data which can hang the pipeline.
+    """
+    def __init__(self, knn_neighbors=5, feature_threshold=500):
+        self.knn_neighbors = knn_neighbors
+        self.feature_threshold = feature_threshold
+        self.imputer_ = None
+
+    def fit(self, X, y=None):
+        X_arr = X if not isinstance(X, pd.DataFrame) else X.values
+        n_features = X_arr.shape[1]
+        if n_features <= self.feature_threshold:
+            self.imputer_ = KNNImputer(n_neighbors=self.knn_neighbors)
+        else:
+            self.imputer_ = SimpleImputer(strategy='median')
+        self.imputer_.fit(X_arr)
+        return self
+
+    def transform(self, X):
+        X_arr = X if not isinstance(X, pd.DataFrame) else X.values
+        return self.imputer_.transform(X_arr)
+
+
+def create_bridge_from_diagnosis_with_acxiom(bridge_path='diagnosis_with_acxiom.csv', out_path='id_bridge.csv'):
+    """Create small bridge CSV mapping diagnosis-side member/sk IDs to Acxiom `member_id`.
+
+    The function looks for common columns like `sys_mbr_sk` / `clm_sys_mbr_sk` on the
+    diagnosis side and `member_id` / `empi` on the Acxiom side inside the
+    `diagnosis_with_acxiom.csv` file. It writes `id_bridge.csv` with columns
+    `diag_id,member_id` (and `empi` if present) and returns the bridge DataFrame.
+    """
+    try:
+        print(f"\nLoading bridge file: {bridge_path}...")
+        df = pd.read_csv(bridge_path, low_memory=False, dtype=str)
+    except FileNotFoundError:
+        print(f"   Bridge file not found: {bridge_path}")
+        return None
+    except Exception as e:
+        print(f"   Failed to read bridge file: {e}")
+        return None
+
+    # candidate columns
+    diag_cands = ['sys_mbr_sk', 'clm_sys_mbr_sk', 'sys_mbr_id', 'clm_mbr_sk']
+    acx_cands = ['member_id', 'empi', 'cerner_empi']
+
+    diag_col = next((c for c in diag_cands if c in df.columns), None)
+    acx_col = next((c for c in acx_cands if c in df.columns), None)
+    empi_col = 'empi' if 'empi' in df.columns else None
+
+    if not diag_col or not acx_col:
+        print(f"   Could not find expected bridge columns. Available columns: {list(df.columns[:20])}")
+        return None
+
+    # Normalize and reduce
+    df = df[[diag_col, acx_col] + ([empi_col] if empi_col else [])].copy()
+    df = df.rename(columns={diag_col: 'diag_id', acx_col: 'member_id'})
+    df['diag_id'] = df['diag_id'].astype(str).str.strip()
+    df['member_id'] = df['member_id'].astype(str).str.strip()
+    if empi_col:
+        df[empi_col] = df[empi_col].astype(str).str.strip()
+
+    df = df[df['diag_id'].notna() & df['member_id'].notna()]
+    df = df.drop_duplicates(subset=['diag_id', 'member_id'])
+
+    try:
+        df.to_csv(out_path, index=False)
+        print(f"   Wrote bridge to: {out_path} (rows: {len(df)})")
+    except Exception:
+        print("   Could not write bridge file to disk, continuing with in-memory bridge")
+
+    print(f"   Example mappings (first 5):\n{df.head().to_string(index=False)}")
+    return df
+
+
+def create_bridge_via_demographics(acxiom_df, demographics_path='demographics.csv', out_path='id_bridge.csv'):
+    """Create a bridge using `demographics.csv` linking `sys_mbr_sk` <-> `empi`,
+    then linking `empi` -> `member_id` from the provided `acxiom_df`.
+
+    Returns bridge DataFrame with columns: diag_sys_mbr_sk, empi, member_id
+    """
+    try:
+        print(f"\nLoading demographics: {demographics_path}...")
+        demo = pd.read_csv(demographics_path, low_memory=False, dtype=str)
+    except FileNotFoundError:
+        print(f"   demographics file not found: {demographics_path}")
+        return None
+    except Exception as e:
+        print(f"   Failed to read demographics file: {e}")
+        return None
+
+    # Find candidate columns
+    demo_sys_cols = [c for c in demo.columns if any(t in c.lower() for t in ['sys_mbr_sk', 'clm_sys_mbr_sk', 'sys_mbr_id', 'clm_mbr_sk'])]
+    demo_empi_cols = [c for c in demo.columns if any(t in c.lower() for t in ['empi', 'lumeris_empi', 'cerner_empi'])]
+    acx_empi_cols = [c for c in acxiom_df.columns if any(t in c.lower() for t in ['empi', 'lumeris_empi', 'cerner_empi'])]
+    acx_member_cols = [c for c in acxiom_df.columns if 'member_id' in c.lower()]
+
+    # If Acxiom doesn't have a `member_id` column but does have an EMPI (lumeris_empi),
+    # we'll treat EMPI as the member identifier (map empi->empi and use as member_id)
+    use_empi_as_member = False
+    if not acx_member_cols and acx_empi_cols:
+        use_empi_as_member = True
+        acx_member_cols = [acx_empi_cols[0]]
+
+    if not demo_sys_cols or not demo_empi_cols:
+        print(f"   Could not find sys_mbr_sk/empi in demographics. Found: sys_cols={demo_sys_cols}, empi_cols={demo_empi_cols}")
+        return None
+    if not acx_empi_cols:
+        print(f"   Could not find any EMPI-like column in Acxiom. Found: acx_empi={acx_empi_cols}")
+        return None
+
+    demo_sys_col = demo_sys_cols[0]
+    demo_empi_col = demo_empi_cols[0]
+    acx_empi_col = acx_empi_cols[0]
+    acx_member_col = acx_member_cols[0]
+
+    # Normalize
+    demo_subset = demo[[demo_sys_col, demo_empi_col]].copy()
+    demo_subset = demo_subset.rename(columns={demo_sys_col: 'sys_mbr_sk', demo_empi_col: 'empi'})
+    demo_subset['sys_mbr_sk'] = demo_subset['sys_mbr_sk'].astype(str).str.strip()
+    demo_subset['empi'] = demo_subset['empi'].astype(str).str.strip()
+    demo_subset = demo_subset.dropna(subset=['sys_mbr_sk', 'empi'])
+    demo_subset = demo_subset.drop_duplicates()
+
+    # Acxiom EMPI -> member_id
+    acx_subset = acxiom_df[[acx_empi_col, acx_member_col]].copy()
+    acx_subset = acx_subset.rename(columns={acx_empi_col: 'empi', acx_member_col: 'member_id'})
+    acx_subset['empi'] = acx_subset['empi'].astype(str).str.strip()
+    acx_subset['member_id'] = acx_subset['member_id'].astype(str).str.strip()
+    acx_subset = acx_subset.dropna(subset=['empi', 'member_id'])
+    acx_subset = acx_subset.drop_duplicates()
+
+    # If we're using EMPI as the member identifier (no explicit member_id column),
+    # normalize by copying empi -> member_id so downstream logic can treat 'member_id'
+    # as the canonical Acxiom key.
+    if use_empi_as_member:
+        acx_subset['member_id'] = acx_subset['empi']
+
+    # Join via empi
+    bridge = demo_subset.merge(acx_subset, on='empi', how='inner')
+    bridge = bridge.rename(columns={'sys_mbr_sk': 'diag_sys_mbr_sk'})
+
+    if bridge.empty:
+        print("   Demographics -> Acxiom join produced zero rows. Check formats (leading zeros, types).")
+        return None
+
+    # Write to disk
+    try:
+        bridge.to_csv(out_path, index=False)
+        print(f"   Wrote demographics-based bridge to {out_path} (rows: {len(bridge)})")
+    except Exception:
+        print("   Could not write bridge file to disk, continuing with in-memory bridge")
+
+    print(f"   Example bridge rows:\n{bridge.head().to_string(index=False)}")
+    return bridge
+
+
 # =============================================================================
 # Step 1: Load and Link Datasets
 # =============================================================================
@@ -153,34 +312,105 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
     print(f"  Shape: {diagnosis.shape}")
     print(f"  Columns (first 10): {list(diagnosis.columns[:10])}")
     
-    # Find common ID column
-    possible_ids = ['sys_mbr_sk', 'clm_sys_mbr_sk', 'member_id', 'empi', 'lumeris_empi']
-    
-    acx_id_col = None
-    for col in possible_ids:
-        if col in acxiom.columns:
-            acx_id_col = col
-            break
-    
-    diag_id_col = None
-    for col in possible_ids:
-        if col in diagnosis.columns:
-            diag_id_col = col
-            break
-    
-    if not acx_id_col:
-        print(f"\n❌ No ID column found in Acxiom. Tried: {possible_ids}")
-        print(f"Available columns: {list(acxiom.columns[:20])}")
-        raise ValueError("Cannot find patient ID column in Acxiom")
-    
-    if not diag_id_col:
-        print(f"\n❌ No ID column found in Diagnosis. Tried: {possible_ids}")
-        print(f"Available columns: {list(diagnosis.columns[:20])}")
-        raise ValueError("Cannot find patient ID column in Diagnosis")
-    
-    print(f"\n✅ ID columns identified:")
+    # Find best candidate ID columns by matching likely ID-like column names.
+    # Prefer real member ID columns and explicitly avoid zipcode-like columns.
+    token_candidates = ['id', 'member', 'empi', 'sys', 'sk', 'clm', 'patient']
+    zip_tokens = ['zip', 'zipcode', 'memberzipcode', 'postal']
+
+    def find_id_candidates(df):
+        cols = [c for c in df.columns if any(t in c.lower() for t in token_candidates)]
+        # exclude obvious zipcode-like columns by name
+        cols = [c for c in cols if not any(z in c.lower() for z in zip_tokens)]
+        return cols
+
+    acx_candidates = find_id_candidates(acxiom)
+    diag_candidates = find_id_candidates(diagnosis)
+
+    # If nothing obvious, fall back to columns that contain 'id' specifically,
+    # but still avoid zipcode-like names
+    if len(acx_candidates) == 0:
+        acx_candidates = [c for c in acxiom.columns if 'id' in c.lower() and not any(z in c.lower() for z in zip_tokens)]
+    if len(diag_candidates) == 0:
+        diag_candidates = [c for c in diagnosis.columns if 'id' in c.lower() and not any(z in c.lower() for z in zip_tokens)]
+
+    # Score candidate pairs by overlap and pick the best pair
+    best_pair = (None, None)
+    best_overlap = -1
+
+    # Convert values to strings and strip for comparison
+    def values_set(df, col):
+        try:
+            return set(df[col].astype(str).str.strip().dropna().unique())
+        except Exception:
+            return set()
+
+    for a_col in acx_candidates:
+        a_vals = values_set(acxiom, a_col)
+        if len(a_vals) == 0:
+            continue
+        for d_col in diag_candidates:
+            d_vals = values_set(diagnosis, d_col)
+            overlap = len(a_vals.intersection(d_vals))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_pair = (a_col, d_col)
+
+    # If best_pair looks like a zipcode (values are 5-digit numeric strings), deprioritize
+    def looks_like_zip(df, col):
+        try:
+            sample = df[col].dropna().astype(str).head(200)
+            if sample.empty:
+                return False
+            matches = sample.str.match(r"^\d{5}$").sum()
+            return matches / len(sample) > 0.8
+        except Exception:
+            return False
+
+    if best_pair[0] is not None and looks_like_zip(acxiom, best_pair[0]):
+        # try to choose a preferred ID column if present
+        # prefer Lumeris EMPI explicitly over member_id when available
+        preferred = ['lumeris_empi', 'member_id', 'empi', 'sys_mbr_sk', 'clm_sys_mbr_sk', 'patient_id']
+        pref_a = next((c for c in preferred if c in acxiom.columns), None)
+        pref_d = next((c for c in preferred if c in diagnosis.columns), None)
+        if pref_a and pref_d:
+            # Check overlap for preferred pair
+            ov = len(values_set(acxiom, pref_a).intersection(values_set(diagnosis, pref_d)))
+            if ov >= best_overlap:
+                best_pair = (pref_a, pref_d)
+                best_overlap = ov
+
+    # If no overlap found using candidates, fall back to a default list
+    if best_pair[0] is None or best_pair[1] is None:
+        possible_ids = ['sys_mbr_sk', 'clm_sys_mbr_sk', 'lumeris_empi', 'empi', 'member_id', 'patient_id']
+        acx_id_col = None
+        for col in possible_ids:
+            if col in acxiom.columns:
+                acx_id_col = col
+                break
+        diag_id_col = None
+        for col in possible_ids:
+            if col in diagnosis.columns:
+                diag_id_col = col
+                break
+        if not acx_id_col or not diag_id_col:
+            print(f"\n❌ Could not confidently identify ID columns.")
+            print(f"Acxiom candidates: {acx_candidates}")
+            print(f"Diagnosis candidates: {diag_candidates}")
+            print(f"Available Acxiom columns: {list(acxiom.columns[:20])}")
+            print(f"Available Diagnosis columns: {list(diagnosis.columns[:20])}")
+            raise ValueError("Cannot find patient ID columns")
+        else:
+            acx_id_col = acx_id_col
+            diag_id_col = diag_id_col
+    else:
+        acx_id_col, diag_id_col = best_pair
+
+    print(f"\n✅ ID columns chosen:")
     print(f"   Acxiom: {acx_id_col}")
     print(f"   Diagnosis: {diag_id_col}")
+
+    if best_overlap >= 0:
+        print(f"   Overlap between these columns: {best_overlap}")
     
     # Normalize IDs
     acxiom[acx_id_col] = acxiom[acx_id_col].astype(str).str.strip()
@@ -200,13 +430,61 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
         print(f"\n⚠️ WARNING: Only {len(common_ids)} common patients!")
         print("   This may be too small for reliable analysis.")
     
+    # If no overlap (or very small), try to use a bridge file that links
+    # diagnosis-side IDs to Acxiom `member_id`. The bridge file is typically
+    # `diagnosis_with_acxiom.csv` and we write/read `id_bridge.csv`.
+    if len(common_ids) == 0:
+        print("\nNo direct patient ID overlap found — attempting to build/use ID bridge...")
+        bridge = None
+        try:
+            # Prefer an existing id_bridge.csv if present
+            bridge = pd.read_csv('id_bridge.csv', dtype=str)
+            print(f"   Loaded existing id_bridge.csv (rows: {len(bridge)})")
+        except Exception:
+            bridge = create_bridge_from_diagnosis_with_acxiom('diagnosis_with_acxiom.csv', out_path='id_bridge.csv')
+
+        # If diagnosis_with_acxiom didn't produce a bridge, try demographics + acxiom mapping
+        if (bridge is None or bridge.empty):
+            try:
+                bridge = create_bridge_via_demographics(acxiom, demographics_path='demographics.csv', out_path='id_bridge.csv')
+            except Exception as e:
+                print(f"   demographics-based bridge failed: {e}")
+
+        if bridge is not None and not bridge.empty:
+            # Build mapping diag_id -> member_id
+            bridge_map = dict(zip(bridge['diag_id'].astype(str).str.strip(), bridge['member_id'].astype(str).str.strip()))
+
+            # Map diagnosis IDs to member_id
+            diagnosis['mapped_member_id'] = diagnosis[diag_id_col].astype(str).str.strip().map(bridge_map)
+            mapped_ids = set(diagnosis['mapped_member_id'].dropna().unique())
+
+            # Prefer Acxiom member_id column if present
+            if 'member_id' in acxiom.columns:
+                acx_id_col = 'member_id'
+
+            acx_ids = set(acxiom[acx_id_col].astype(str).str.strip().unique())
+            common_ids = acx_ids.intersection(mapped_ids)
+
+            print(f"   Bridge-enabled overlap: {len(common_ids)} patients")
+            if len(common_ids) == 0:
+                print("   Bridge found but no matching member_ids in Acxiom — bridge may use different formats.")
+        else:
+            print("   No usable bridge available.")
     # Filter to common patients
-    acxiom_filtered = acxiom[acxiom[acx_id_col].isin(common_ids)].copy()
-    diagnosis_filtered = diagnosis[diagnosis[diag_id_col].isin(common_ids)].copy()
+    acxiom_filtered = acxiom[acxiom[acx_id_col].astype(str).str.strip().isin(common_ids)].copy()
+    # If we created a mapped_member_id via bridge use it for filtering
+    if 'mapped_member_id' in diagnosis.columns:
+        diagnosis_filtered = diagnosis[diagnosis['mapped_member_id'].astype(str).str.strip().isin(common_ids)].copy()
+    else:
+        diagnosis_filtered = diagnosis[diagnosis[diag_id_col].astype(str).str.strip().isin(common_ids)].copy()
     
     # Rename ID columns to standard name
     acxiom_filtered = acxiom_filtered.rename(columns={acx_id_col: 'patient_id'})
-    diagnosis_filtered = diagnosis_filtered.rename(columns={diag_id_col: 'patient_id'})
+    # Rename diagnosis id to patient_id — prefer mapped_member_id if available
+    if 'mapped_member_id' in diagnosis_filtered.columns:
+        diagnosis_filtered = diagnosis_filtered.rename(columns={'mapped_member_id': 'patient_id'})
+    else:
+        diagnosis_filtered = diagnosis_filtered.rename(columns={diag_id_col: 'patient_id'})
     
     return acxiom_filtered, diagnosis_filtered, list(common_ids)
 
@@ -227,29 +505,31 @@ def extract_diagnosis_codes(diagnosis_df):
     print("Step 2: Extracting Diagnosis Codes")
     print("=" * 70)
     
-    # Find diagnosis code column
-    diag_code_candidates = ['diagnosis_code', 'dx_code', 'diag_code', 'icd_code', 
-                           'icd10', 'icd9', 'dx', 'diagnosis', 'code']
-    
+    # Find diagnosis code column using substring matching (more flexible)
+    diag_code_tokens = ['diagnosis', 'diag', 'dx', 'icd', 'icd9', 'icd10', 'code']
     diag_col = None
-    for col in diag_code_candidates:
-        if col in diagnosis_df.columns:
+
+    for col in diagnosis_df.columns:
+        col_l = col.lower()
+        if any(tok in col_l for tok in diag_code_tokens):
             diag_col = col
             break
-    
-    # Case-insensitive search
+
+    # If not found yet, try exact matches as a final fallback
     if not diag_col:
+        diag_code_candidates = ['diagnosis_code', 'dx_code', 'diag_code', 'icd_code',
+                                'icd10', 'icd9', 'dx', 'diagnosis', 'code']
         cols_lower = {c.lower(): c for c in diagnosis_df.columns}
         for cand in diag_code_candidates:
             if cand.lower() in cols_lower:
                 diag_col = cols_lower[cand.lower()]
                 break
-    
+
     if not diag_col:
-        print(f"\n❌ No diagnosis code column found. Tried: {diag_code_candidates}")
+        print(f"\n❌ No diagnosis code column found. Tried tokens: {diag_code_tokens}")
         print(f"Available columns: {list(diagnosis_df.columns[:20])}")
         raise ValueError("Cannot find diagnosis code column")
-    
+
     print(f"\n✅ Diagnosis code column: {diag_col}")
     
     # Build patient → diagnoses mapping
@@ -407,8 +687,17 @@ def prepare_features(acxiom_df):
     # Identify SDoH columns (pattern: 2 letters + numbers, or ibe*)
     pattern = re.compile(r'^[a-z]{2}\d+|^ibe\d+', re.IGNORECASE)
     sdoh_cols = [col for col in acxiom_df.columns if pattern.match(col)]
-    
-    print(f"\n✅ Found {len(sdoh_cols)} SDoH columns")
+
+    # Exclude any columns that look like diagnosis/claim fields to avoid leakage
+    exclusion_tokens = ['diag', 'icd', 'dx', 'diagnosis', 'claim', 'clm', 'disease',
+                        'clinical', 'code', 'procedure', 'proc', 'admit', 'encounter']
+    excluded = [c for c in sdoh_cols if any(tok in c.lower() for tok in exclusion_tokens)]
+    if excluded:
+        print(f"\n⚠️ Excluding {len(excluded)} potential leakage columns by name")
+        print(f"   Examples excluded: {excluded[:10]}")
+    sdoh_cols = [c for c in sdoh_cols if c not in excluded]
+
+    print(f"\n✅ Found {len(sdoh_cols)} SDoH columns (after exclusion)")
     print(f"   Examples: {sdoh_cols[:10]}")
     
     if len(sdoh_cols) == 0:
@@ -441,6 +730,8 @@ def prepare_features(acxiom_df):
     return X_raw, sdoh_cols
 
 
+
+
 # =============================================================================
 # Step 6: Create Leakage-Free Model Pipelines
 # =============================================================================
@@ -454,14 +745,14 @@ def create_model_pipelines():
     
     models['Random Forest'] = Pipeline([
         ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-        ('imputer', KNNImputer(n_neighbors=5)),
+        ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
         ('scaler', StandardScaler()),
         ('model', RandomForestClassifier(**RF_PARAMS))
     ])
     
     models['Gradient Boosting'] = Pipeline([
         ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-        ('imputer', KNNImputer(n_neighbors=5)),
+        ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
         ('scaler', StandardScaler()),
         ('model', GradientBoostingClassifier(**GB_PARAMS))
     ])
@@ -476,7 +767,7 @@ def create_model_pipelines():
         }
         models['LightGBM'] = Pipeline([
             ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', KNNImputer(n_neighbors=5)),
+            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
             ('scaler', StandardScaler()),
             ('model', lgb.LGBMClassifier(**lgbm_params))
         ])
@@ -490,7 +781,7 @@ def create_model_pipelines():
         }
         models['XGBoost'] = Pipeline([
             ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', KNNImputer(n_neighbors=5)),
+            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
             ('scaler', StandardScaler()),
             ('model', xgb.XGBClassifier(**xgb_params))
         ])
@@ -505,7 +796,7 @@ def create_model_pipelines():
         }
         models['CatBoost'] = Pipeline([
             ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', KNNImputer(n_neighbors=5)),
+            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
             ('scaler', StandardScaler()),
             ('model', CatBoostClassifier(**catboost_params))
         ])
