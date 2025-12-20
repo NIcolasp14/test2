@@ -969,6 +969,15 @@ def evaluate_diagnosis(X_raw, y, diagnosis_code, models):
         print("   Consider relaxing hyperparameters or checking data quality")
     else:
         print(f"\n✅ {len(results_df)}/{len(models)} models passed quality checks")
+        
+        # Add composite score that balances F1 and generalization
+        # Formula: F1 * (1 - overfitting_penalty)
+        # Penalty increases sharply with overfit gap
+        results_df['Composite_Score'] = results_df.apply(
+            lambda row: row['F1'] * (1 - min(row['Overfit_Gap'] * 2.0, 0.5)),
+            axis=1
+        )
+        print("\n📊 Composite scoring applied (balances F1 vs generalization)")
     
     return results_df
 
@@ -1254,65 +1263,99 @@ def create_model_comparison_for_diagnosis(results_df, diagnosis_code, viz_folder
     """
     print(f"\n📊 Creating model comparison for {diagnosis_code}...")
     
-    # Sort by F1 score
-    results_sorted = results_df.sort_values('F1', ascending=False)
+    # Sort by Composite Score (smart selection)
+    results_sorted = results_df.sort_values('Composite_Score', ascending=False)
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
     models = results_sorted['Model'].values
     n_models = len(models)
     colors = plt.cm.viridis(np.linspace(0.3, 0.9, n_models))
     
-    # 1. F1-Score comparison
+    # 1. Composite Score (SMART SELECTION)
     ax1 = axes[0, 0]
-    bars1 = ax1.barh(range(n_models), results_sorted['F1'], color=colors)
+    bars1 = ax1.barh(range(n_models), results_sorted['Composite_Score'], color=colors)
     ax1.set_yticks(range(n_models))
-    ax1.set_yticklabels(models)
-    ax1.set_xlabel('F1-Score', fontsize=11)
-    ax1.set_title(f'F1-Score by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax1.set_yticklabels(models, fontsize=9)
+    ax1.set_xlabel('Composite Score', fontsize=11, fontweight='bold')
+    ax1.set_title(f'🏆 Composite Score (Smart Selection)\n({diagnosis_code})', fontsize=12, fontweight='bold')
     ax1.grid(axis='x', alpha=0.3)
     ax1.invert_yaxis()
-    # Add values on bars
-    for i, (bar, val) in enumerate(zip(bars1, results_sorted['F1'])):
+    for i, (bar, val) in enumerate(zip(bars1, results_sorted['Composite_Score'])):
         ax1.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
     
-    # 2. ROC-AUC comparison
+    # 2. F1-Score comparison
     ax2 = axes[0, 1]
-    bars2 = ax2.barh(range(n_models), results_sorted['ROC_AUC'], color=colors)
+    bars2 = ax2.barh(range(n_models), results_sorted['F1'], color=colors)
     ax2.set_yticks(range(n_models))
-    ax2.set_yticklabels(models)
-    ax2.set_xlabel('ROC-AUC', fontsize=11)
-    ax2.set_title(f'ROC-AUC by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax2.set_yticklabels(models, fontsize=9)
+    ax2.set_xlabel('F1-Score', fontsize=11)
+    ax2.set_title(f'F1-Score by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
     ax2.grid(axis='x', alpha=0.3)
     ax2.invert_yaxis()
-    for i, (bar, val) in enumerate(zip(bars2, results_sorted['ROC_AUC'])):
+    for i, (bar, val) in enumerate(zip(bars2, results_sorted['F1'])):
         ax2.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
     
-    # 3. Accuracy with error bars
-    ax3 = axes[1, 0]
-    bars3 = ax3.barh(range(n_models), results_sorted['Accuracy'], 
-                     xerr=results_sorted['Accuracy_Std'], color=colors, capsize=5)
+    # 3. ROC-AUC comparison
+    ax3 = axes[0, 2]
+    bars3 = ax3.barh(range(n_models), results_sorted['ROC_AUC'], color=colors)
     ax3.set_yticks(range(n_models))
-    ax3.set_yticklabels(models)
-    ax3.set_xlabel('Accuracy ± Std', fontsize=11)
-    ax3.set_title(f'Accuracy by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax3.set_yticklabels(models, fontsize=9)
+    ax3.set_xlabel('ROC-AUC', fontsize=11)
+    ax3.set_title(f'ROC-AUC by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
     ax3.grid(axis='x', alpha=0.3)
     ax3.invert_yaxis()
+    for i, (bar, val) in enumerate(zip(bars3, results_sorted['ROC_AUC'])):
+        ax3.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
     
-    # 4. Overfitting analysis
-    ax4 = axes[1, 1]
+    # 4. Accuracy with error bars
+    ax4 = axes[1, 0]
+    bars4 = ax4.barh(range(n_models), results_sorted['Accuracy'], 
+                     xerr=results_sorted['Accuracy_Std'], color=colors, capsize=5)
+    ax4.set_yticks(range(n_models))
+    ax4.set_yticklabels(models, fontsize=9)
+    ax4.set_xlabel('Accuracy ± Std', fontsize=11)
+    ax4.set_title(f'Accuracy by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax4.grid(axis='x', alpha=0.3)
+    ax4.invert_yaxis()
+    
+    # 5. Overfitting analysis
+    ax5 = axes[1, 1]
     gap_colors = ['red' if gap > 0.1 else 'orange' if gap > 0.05 else 'green' 
                   for gap in results_sorted['Overfit_Gap']]
-    bars4 = ax4.barh(range(n_models), results_sorted['Overfit_Gap'], color=gap_colors, alpha=0.7)
-    ax4.set_yticks(range(n_models))
-    ax4.set_yticklabels(models)
-    ax4.set_xlabel('Overfit Gap (Train - Test)', fontsize=11)
-    ax4.set_title(f'Generalization by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
-    ax4.axvline(x=0.05, color='orange', linestyle='--', alpha=0.5, linewidth=2, label='Warning')
-    ax4.axvline(x=0.1, color='red', linestyle='--', alpha=0.5, linewidth=2, label='High')
-    ax4.grid(axis='x', alpha=0.3)
-    ax4.legend(loc='best', fontsize=9)
-    ax4.invert_yaxis()
+    bars5 = ax5.barh(range(n_models), results_sorted['Overfit_Gap'], color=gap_colors, alpha=0.7)
+    ax5.set_yticks(range(n_models))
+    ax5.set_yticklabels(models, fontsize=9)
+    ax5.set_xlabel('Overfit Gap (Train - Test)', fontsize=11)
+    ax5.set_title(f'Generalization by Model\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax5.axvline(x=0.05, color='orange', linestyle='--', alpha=0.5, linewidth=2, label='Warning')
+    ax5.axvline(x=0.1, color='red', linestyle='--', alpha=0.5, linewidth=2, label='High')
+    ax5.grid(axis='x', alpha=0.3)
+    ax5.legend(loc='best', fontsize=9)
+    ax5.invert_yaxis()
+    
+    # 6. F1 vs Overfit Gap scatter
+    ax6 = axes[1, 2]
+    scatter_colors = ['green' if gap < 0.05 else 'orange' if gap < 0.1 else 'red' 
+                     for gap in results_sorted['Overfit_Gap']]
+    ax6.scatter(results_sorted['Overfit_Gap'], results_sorted['F1'], 
+               c=scatter_colors, s=100, alpha=0.7, edgecolors='black', linewidths=1.5)
+    
+    # Annotate best model
+    best_idx = 0
+    ax6.annotate('BEST', 
+                xy=(results_sorted.iloc[best_idx]['Overfit_Gap'], results_sorted.iloc[best_idx]['F1']),
+                xytext=(10, 10), textcoords='offset points',
+                fontsize=10, fontweight='bold', color='darkgreen',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0', color='darkgreen', lw=2))
+    
+    ax6.set_xlabel('Overfit Gap', fontsize=11, fontweight='bold')
+    ax6.set_ylabel('F1-Score', fontsize=11, fontweight='bold')
+    ax6.set_title(f'F1 vs Generalization Trade-off\n({diagnosis_code})', fontsize=12, fontweight='bold')
+    ax6.axvline(x=0.05, color='orange', linestyle='--', alpha=0.3, linewidth=2)
+    ax6.axvline(x=0.1, color='red', linestyle='--', alpha=0.3, linewidth=2)
+    ax6.grid(alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(f'{viz_folder}/0_all_models_comparison.png', dpi=300, bbox_inches='tight')
@@ -1633,7 +1676,185 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
 # Step 10: Comparative Analysis Across All Diagnoses
 # =============================================================================
 
-def create_comparative_analysis(all_diagnosis_results, all_refined_results):
+def aggregate_feature_importances(all_feature_importances):
+    """
+    Aggregate feature importances across all diagnosis runs.
+    
+    Args:
+        all_feature_importances: List of dicts with 'diagnosis' and 'importance_df'
+    
+    Returns:
+        feature_summary_df: Complete aggregated statistics (for CSV)
+        top20_features: Top 20 features for visualization
+    """
+    print("\n" + "=" * 70)
+    print("AGGREGATING FEATURE IMPORTANCES ACROSS ALL DIAGNOSES")
+    print("=" * 70)
+    
+    if not all_feature_importances:
+        print("⚠️ No feature importances to aggregate")
+        return None, None
+    
+    # Collect all feature importances
+    all_features = defaultdict(list)
+    
+    for item in all_feature_importances:
+        dx = item['diagnosis']
+        importance_df = item['importance_df']
+        
+        if importance_df is not None and not importance_df.empty:
+            for _, row in importance_df.iterrows():
+                all_features[row['feature']].append({
+                    'diagnosis': dx,
+                    'importance': row['importance']
+                })
+    
+    print(f"\n✅ Collected importances for {len(all_features)} unique features")
+    print(f"   Across {len(all_feature_importances)} diagnoses")
+    
+    # Aggregate statistics
+    feature_stats = []
+    
+    for feature, data in all_features.items():
+        importances = [d['importance'] for d in data]
+        diagnoses_appeared = [d['diagnosis'] for d in data]
+        
+        feature_stats.append({
+            'feature': feature,
+            'frequency': len(importances),  # How many diagnoses this feature appeared in
+            'avg_importance': np.mean(importances),
+            'std_importance': np.std(importances),
+            'min_importance': np.min(importances),
+            'max_importance': np.max(importances),
+            'median_importance': np.median(importances),
+            'total_weight': np.sum(importances),  # Cumulative importance
+            'diagnoses': ', '.join(diagnoses_appeared[:5]) + ('...' if len(diagnoses_appeared) > 5 else '')
+        })
+    
+    feature_summary_df = pd.DataFrame(feature_stats)
+    
+    # Sort by composite metric: frequency * avg_importance
+    feature_summary_df['composite_score'] = (
+        feature_summary_df['frequency'] * feature_summary_df['avg_importance']
+    )
+    feature_summary_df = feature_summary_df.sort_values('composite_score', ascending=False)
+    
+    print(f"\n📊 Feature Statistics:")
+    print(f"   Most frequent: {feature_summary_df.iloc[0]['feature']} ({feature_summary_df.iloc[0]['frequency']} diagnoses)")
+    print(f"   Highest avg importance: {feature_summary_df.nlargest(1, 'avg_importance').iloc[0]['feature']}")
+    
+    # Get top 20 for visualization
+    top20_features = feature_summary_df.head(20).copy()
+    
+    return feature_summary_df, top20_features
+
+
+def visualize_feature_importance_overlap(top20_features, all_feature_importances, filename):
+    """
+    Create comprehensive visualization of top 20 features across all runs.
+    """
+    print("\n📊 Creating feature importance overlap visualization...")
+    
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+    
+    # 1. Top 20 by Composite Score (Frequency × Avg Importance)
+    ax1 = fig.add_subplot(gs[0, :])
+    colors_comp = plt.cm.RdYlGn(top20_features['composite_score'] / top20_features['composite_score'].max())
+    bars1 = ax1.barh(range(len(top20_features)), top20_features['composite_score'], color=colors_comp)
+    ax1.set_yticks(range(len(top20_features)))
+    ax1.set_yticklabels(top20_features['feature'], fontsize=10)
+    ax1.set_xlabel('Composite Score (Frequency × Avg Importance)', fontsize=12, fontweight='bold')
+    ax1.set_title('Top 20 Most Important Features Across All Diagnoses\n(Ranked by Frequency × Average Importance)', 
+                  fontsize=14, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    
+    # Add value labels
+    for i, (bar, val, freq) in enumerate(zip(bars1, top20_features['composite_score'], top20_features['frequency'])):
+        ax1.text(val + val*0.02, i, f'{val:.3f} (n={freq})', 
+                va='center', fontsize=9, fontweight='bold')
+    
+    # 2. Frequency Distribution
+    ax2 = fig.add_subplot(gs[1, 0])
+    colors_freq = plt.cm.Blues(top20_features['frequency'] / top20_features['frequency'].max())
+    ax2.barh(range(len(top20_features)), top20_features['frequency'], color=colors_freq)
+    ax2.set_yticks(range(len(top20_features)))
+    ax2.set_yticklabels(top20_features['feature'], fontsize=9)
+    ax2.set_xlabel('Number of Diagnoses', fontsize=11, fontweight='bold')
+    ax2.set_title('Feature Frequency\n(How many diagnoses each feature appeared in)', 
+                  fontsize=12, fontweight='bold')
+    ax2.grid(axis='x', alpha=0.3)
+    ax2.invert_yaxis()
+    
+    # 3. Average Importance
+    ax3 = fig.add_subplot(gs[1, 1])
+    colors_imp = plt.cm.Oranges(top20_features['avg_importance'] / top20_features['avg_importance'].max())
+    ax3.barh(range(len(top20_features)), top20_features['avg_importance'], 
+            xerr=top20_features['std_importance'], color=colors_imp, capsize=3)
+    ax3.set_yticks(range(len(top20_features)))
+    ax3.set_yticklabels(top20_features['feature'], fontsize=9)
+    ax3.set_xlabel('Average Importance ± Std', fontsize=11, fontweight='bold')
+    ax3.set_title('Average Feature Importance\n(Mean across all diagnoses ± Std)', 
+                  fontsize=12, fontweight='bold')
+    ax3.grid(axis='x', alpha=0.3)
+    ax3.invert_yaxis()
+    
+    # 4. Consistency Analysis (std/mean ratio)
+    ax4 = fig.add_subplot(gs[2, 0])
+    consistency = top20_features['std_importance'] / (top20_features['avg_importance'] + 1e-10)
+    colors_cons = ['green' if c < 0.5 else 'orange' if c < 1.0 else 'red' for c in consistency]
+    ax4.barh(range(len(top20_features)), consistency, color=colors_cons, alpha=0.7)
+    ax4.set_yticks(range(len(top20_features)))
+    ax4.set_yticklabels(top20_features['feature'], fontsize=9)
+    ax4.set_xlabel('Coefficient of Variation (Std/Mean)', fontsize=11, fontweight='bold')
+    ax4.set_title('Feature Consistency\n(Lower = more consistent across diagnoses)', 
+                  fontsize=12, fontweight='bold')
+    ax4.axvline(x=0.5, color='orange', linestyle='--', alpha=0.5, label='Moderate (0.5)')
+    ax4.axvline(x=1.0, color='red', linestyle='--', alpha=0.5, label='High (1.0)')
+    ax4.grid(axis='x', alpha=0.3)
+    ax4.legend(fontsize=9)
+    ax4.invert_yaxis()
+    
+    # 5. Heatmap: Top 10 features across diagnoses
+    ax5 = fig.add_subplot(gs[2, 1])
+    
+    # Create matrix: diagnoses × top 10 features
+    top10_features = top20_features.head(10)['feature'].tolist()
+    diagnoses = list(set([item['diagnosis'] for item in all_feature_importances]))[:15]  # Limit to 15 diagnoses for readability
+    
+    heatmap_data = []
+    for dx in diagnoses:
+        row = []
+        for feat in top10_features:
+            # Find importance for this feature in this diagnosis
+            importance = 0
+            for item in all_feature_importances:
+                if item['diagnosis'] == dx and item['importance_df'] is not None:
+                    match = item['importance_df'][item['importance_df']['feature'] == feat]
+                    if not match.empty:
+                        importance = match.iloc[0]['importance']
+                        break
+            row.append(importance)
+        heatmap_data.append(row)
+    
+    heatmap_df = pd.DataFrame(heatmap_data, index=diagnoses, columns=top10_features)
+    
+    sns.heatmap(heatmap_df, annot=True, fmt='.3f', cmap='YlOrRd', 
+                ax=ax5, cbar_kws={'label': 'Importance'}, linewidths=0.5)
+    ax5.set_xlabel('Feature', fontsize=11, fontweight='bold')
+    ax5.set_ylabel('Diagnosis', fontsize=11, fontweight='bold')
+    ax5.set_title('Top 10 Features Across Diagnoses\n(Feature importance heatmap)', 
+                  fontsize=12, fontweight='bold')
+    plt.setp(ax5.get_xticklabels(), rotation=45, ha='right', fontsize=9)
+    plt.setp(ax5.get_yticklabels(), rotation=0, fontsize=9)
+    
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {filename}")
+    plt.close()
+
+
+def create_comparative_analysis(all_diagnosis_results, all_refined_results, all_feature_importances):
     """
     Create comparative visualizations across all diagnoses.
     """
@@ -1641,12 +1862,30 @@ def create_comparative_analysis(all_diagnosis_results, all_refined_results):
     print("COMPARATIVE ANALYSIS ACROSS ALL DIAGNOSES")
     print("=" * 70)
     
+    # 0. Feature Importance Aggregation and Visualization
+    feature_summary_df, top20_features = aggregate_feature_importances(all_feature_importances)
+    
+    if feature_summary_df is not None:
+        # Save complete feature statistics to CSV
+        csv_path = f'{COMPARATIVE_FOLDER}/feature_importance_summary.csv'
+        feature_summary_df.to_csv(csv_path, index=False)
+        print(f"\n✅ Saved complete feature statistics: {csv_path}")
+        print(f"   Total features: {len(feature_summary_df)}")
+        print(f"   Top 20 visualized in plot")
+        
+        # Create visualization
+        visualize_feature_importance_overlap(
+            top20_features, 
+            all_feature_importances,
+            f'{COMPARATIVE_FOLDER}/0_feature_importance_analysis.png'
+        )
+    
     # 1. Performance comparison across diagnoses
     print("\n📊 1. Creating performance comparison...")
     
-    # Get best model per diagnosis
+    # Get best model per diagnosis using COMPOSITE SCORE (balances F1 and generalization)
     best_per_dx = all_diagnosis_results.loc[
-        all_diagnosis_results.groupby('Diagnosis')['F1'].idxmax()
+        all_diagnosis_results.groupby('Diagnosis')['Composite_Score'].idxmax()
     ]
     
     best_per_dx = best_per_dx.sort_values('F1', ascending=False)
@@ -1816,6 +2055,7 @@ def main():
     
     all_results = []
     all_refined_results = []
+    all_feature_importances = []  # Track feature importances across all runs
     
     for i, dx_info in enumerate(valid_diagnoses, 1):
         dx_code = dx_info['code']
@@ -1847,9 +2087,17 @@ def main():
         
         # Print summary
         if not results_df.empty:
-            best = results_df.sort_values('F1', ascending=False).iloc[0]
-            print(f"\n✅ Best model: {best['Model']}")
+            # Sort by COMPOSITE SCORE (balances F1 and generalization)
+            best = results_df.sort_values('Composite_Score', ascending=False).iloc[0]
+            print(f"\n✅ Best model (by composite score): {best['Model']}")
             print(f"   F1: {best['F1']:.3f}, ROC-AUC: {best['ROC_AUC']:.3f}, Gap: {best['Overfit_Gap']:.3f}")
+            print(f"   Composite Score: {best['Composite_Score']:.3f} (F1 × generalization penalty)")
+            
+            # Show comparison with pure F1 selection
+            best_f1 = results_df.sort_values('F1', ascending=False).iloc[0]
+            if best_f1['Model'] != best['Model']:
+                print(f"\n   ℹ️  Note: Pure F1 would select {best_f1['Model']} (F1={best_f1['F1']:.3f}, Gap={best_f1['Overfit_Gap']:.3f})")
+                print(f"   But composite score prefers {best['Model']} for better generalization")
             
             # Create visualizations comparing all models and highlighting best
             Path(viz_folder).mkdir(parents=True, exist_ok=True)
@@ -1862,6 +2110,12 @@ def main():
             
             # Extract feature importances
             importance_df = extract_feature_importances(X_raw, y, X_raw.columns.tolist(), best_pipeline)
+            
+            # Store for cross-diagnosis analysis
+            all_feature_importances.append({
+                'diagnosis': dx_code,
+                'importance_df': importance_df
+            })
             
             if importance_df is not None:
                 # Save visualizations for this diagnosis
@@ -1903,7 +2157,7 @@ def main():
         print("Step 8: COMPARATIVE ANALYSIS")
         print("=" * 70)
         
-        create_comparative_analysis(final_results, all_refined_results)
+        create_comparative_analysis(final_results, all_refined_results, all_feature_importances)
         
         # Final Summary
         print("\n" + "=" * 70)
@@ -1917,6 +2171,8 @@ def main():
         print(f"   - visualisations_E78_5/")
         print(f"   - ... (one folder per diagnosis)")
         print(f"\n   Comparative Analysis: {COMPARATIVE_FOLDER}/")
+        print(f"   - 0_feature_importance_analysis.png (NEW! Top 20 features)")
+        print(f"   - feature_importance_summary.csv (NEW! All features with stats)")
         print(f"   - 1_performance_comparison.png")
         print(f"   - 2_refined_comparison.png")
         print(f"   - summary_statistics.csv")
