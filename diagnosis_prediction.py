@@ -1673,6 +1673,657 @@ def create_advanced_visualizations(X_refined, y, y_pred, y_pred_proba,
 
 
 # =============================================================================
+# Step 9: Advanced Feature Analysis
+# =============================================================================
+
+def analyze_feature_stability(X_raw, y, top_features, best_pipeline, n_folds=5):
+    """
+    Analyze how stable feature importances are across CV folds.
+    ONLY runs on pre-filtered top features (not all 3000+).
+    Returns DataFrame with stability metrics for each feature.
+    """
+    print("\n" + "=" * 70)
+    print(f"Feature Stability Analysis (Top {len(top_features)} features)")
+    print("=" * 70)
+    
+    X_top = X_raw[top_features].copy()
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+    
+    # Store importances from each fold
+    fold_importances = defaultdict(list)
+    
+    print(f"   Running {n_folds}-fold CV to assess stability...")
+    
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X_top, y), 1):
+        X_train = X_top.iloc[train_idx]
+        y_train = y.iloc[train_idx]
+        
+        # Fit pipeline
+        best_pipeline.fit(X_train, y_train)
+        
+        # Get trained model
+        trained_model = best_pipeline.named_steps['model']
+        
+        # Get feature names after column dropping
+        dropper = best_pipeline.named_steps['dropper']
+        kept_features = dropper.cols_to_keep_
+        
+        # Extract importances
+        if hasattr(trained_model, 'feature_importances_'):
+            importances = trained_model.feature_importances_
+            
+            for feat, imp in zip(kept_features, importances):
+                fold_importances[feat].append(imp)
+    
+    # Calculate stability metrics
+    stability_results = []
+    for feature in top_features:
+        if feature in fold_importances and len(fold_importances[feature]) > 0:
+            imps = fold_importances[feature]
+            mean_imp = np.mean(imps)
+            std_imp = np.std(imps)
+            
+            stability_results.append({
+                'feature': feature,
+                'mean_importance': mean_imp,
+                'std_importance': std_imp,
+                'cv': std_imp / (mean_imp + 1e-10),  # Coefficient of variation
+                'min_importance': np.min(imps),
+                'max_importance': np.max(imps),
+                'range': np.max(imps) - np.min(imps),
+                'stability_score': 1.0 / (1.0 + std_imp)  # Higher = more stable
+            })
+    
+    stability_df = pd.DataFrame(stability_results).sort_values('stability_score', ascending=False)
+    
+    print(f"✅ Analyzed {len(stability_df)} features across {n_folds} folds")
+    print(f"\n   Most Stable (Top 5):")
+    for idx, row in stability_df.head(5).iterrows():
+        print(f"      {row['feature']}: stability={row['stability_score']:.3f}, CV={row['cv']:.3f}")
+    
+    return stability_df
+
+
+def analyze_univariate_power(X_raw, y, top_features):
+    """
+    Calculate univariate discriminative power (ROC-AUC) for top features.
+    Much faster than full dataset analysis - only runs on pre-filtered features.
+    """
+    print("\n" + "=" * 70)
+    print(f"Univariate Discriminative Power (Top {len(top_features)} features)")
+    print("=" * 70)
+    
+    from sklearn.metrics import roc_auc_score
+    from sklearn.impute import SimpleImputer
+    
+    univariate_results = []
+    
+    print(f"   Calculating individual feature ROC-AUC scores...")
+    
+    for feature in top_features:
+        try:
+            # Get feature values
+            feature_values = X_raw[feature].values.reshape(-1, 1)
+            
+            # Impute missing values
+            imputer = SimpleImputer(strategy='median')
+            feature_imputed = imputer.fit_transform(feature_values).ravel()
+            
+            # Calculate ROC-AUC
+            try:
+                auc = roc_auc_score(y, feature_imputed)
+                # If AUC < 0.5, the feature has inverse relationship
+                auc = max(auc, 1 - auc)
+            except:
+                auc = 0.5
+            
+            # Calculate effect size (Cohen's d)
+            class_vals = y.unique()
+            class_0_mean = feature_imputed[y == class_vals[0]].mean()
+            class_1_mean = feature_imputed[y == class_vals[1]].mean()
+            pooled_std = feature_imputed.std()
+            cohens_d = abs(class_1_mean - class_0_mean) / (pooled_std + 1e-10)
+            
+            univariate_results.append({
+                'feature': feature,
+                'univariate_auc': auc,
+                'cohens_d': cohens_d,
+                'class_0_mean': class_0_mean,
+                'class_1_mean': class_1_mean,
+                'difference': abs(class_1_mean - class_0_mean)
+            })
+        except Exception as e:
+            # Silent fail for problematic features
+            pass
+    
+    univariate_df = pd.DataFrame(univariate_results).sort_values('univariate_auc', ascending=False)
+    
+    print(f"✅ Analyzed {len(univariate_df)} features")
+    print(f"\n   Top 5 by Univariate AUC:")
+    for idx, row in univariate_df.head(5).iterrows():
+        print(f"      {row['feature']}: AUC={row['univariate_auc']:.3f}, Cohen's d={row['cohens_d']:.3f}")
+    
+    return univariate_df
+
+
+def analyze_global_feature_statistics(X_raw, feature_names):
+    """
+    EFFICIENT global analysis across ALL features (even 3000+).
+    Calculates summary statistics without expensive computations.
+    """
+    print("\n" + "=" * 70)
+    print(f"Global Feature Statistics (All {len(feature_names)} features)")
+    print("=" * 70)
+    
+    global_stats = []
+    
+    print(f"   Computing missingness, variance, and basic stats...")
+    
+    for feature in feature_names:
+        if feature not in X_raw.columns:
+            continue
+            
+        values = X_raw[feature]
+        
+        # Fast statistics
+        missing_pct = values.isna().sum() / len(values)
+        
+        # Only compute variance for non-missing values
+        non_missing = values.dropna()
+        if len(non_missing) > 0:
+            variance = non_missing.var()
+            mean_val = non_missing.mean()
+            std_val = non_missing.std()
+            n_unique = non_missing.nunique()
+        else:
+            variance = 0
+            mean_val = 0
+            std_val = 0
+            n_unique = 0
+        
+        global_stats.append({
+            'feature': feature,
+            'missing_pct': missing_pct,
+            'variance': variance,
+            'mean': mean_val,
+            'std': std_val,
+            'n_unique': n_unique,
+            'data_quality': 1.0 - missing_pct  # Higher = better
+        })
+    
+    global_df = pd.DataFrame(global_stats)
+    
+    print(f"✅ Analyzed {len(global_df)} features")
+    print(f"\n   Summary:")
+    print(f"      Avg missing: {global_df['missing_pct'].mean()*100:.1f}%")
+    print(f"      Zero variance features: {(global_df['variance'] == 0).sum()}")
+    print(f"      High quality (>80% complete): {(global_df['missing_pct'] < 0.2).sum()}")
+    
+    return global_df
+
+
+def calculate_feature_quality_score(stability_df, univariate_df, importance_df, global_df=None):
+    """
+    Calculate composite feature quality score combining:
+    - Model importance (from trained model)
+    - Stability across folds
+    - Univariate discriminative power
+    - Data quality (if global stats provided)
+    
+    Focus on TOP features only (not all 3000).
+    """
+    print("\n" + "=" * 70)
+    print("Calculating Composite Feature Quality Scores")
+    print("=" * 70)
+    
+    # Start with model importance (top features only)
+    quality_df = importance_df.copy()
+    
+    # Add stability metrics
+    stability_dict = dict(zip(stability_df['feature'], stability_df['stability_score']))
+    quality_df['stability_score'] = quality_df['feature'].map(stability_dict).fillna(0)
+    
+    # Add univariate AUC
+    univariate_dict = dict(zip(univariate_df['feature'], univariate_df['univariate_auc']))
+    quality_df['univariate_auc'] = quality_df['feature'].map(univariate_dict).fillna(0.5)
+    
+    # Add data quality if available
+    if global_df is not None:
+        quality_dict = dict(zip(global_df['feature'], global_df['data_quality']))
+        quality_df['data_quality'] = quality_df['feature'].map(quality_dict).fillna(0.5)
+    else:
+        quality_df['data_quality'] = 1.0  # Assume good quality
+    
+    # Normalize all metrics to 0-1 range
+    from sklearn.preprocessing import MinMaxScaler
+    scaler = MinMaxScaler()
+    
+    quality_df['importance_norm'] = scaler.fit_transform(quality_df[['importance']])
+    quality_df['stability_norm'] = scaler.fit_transform(quality_df[['stability_score']])
+    quality_df['univariate_norm'] = scaler.fit_transform(quality_df[['univariate_auc']])
+    quality_df['data_quality_norm'] = scaler.fit_transform(quality_df[['data_quality']])
+    
+    # Calculate composite quality score (weighted average)
+    quality_df['quality_score'] = (
+        0.35 * quality_df['importance_norm'] +      # 35% model importance
+        0.25 * quality_df['stability_norm'] +       # 25% stability
+        0.25 * quality_df['univariate_norm'] +      # 25% univariate power
+        0.15 * quality_df['data_quality_norm']      # 15% data quality
+    )
+    
+    quality_df = quality_df.sort_values('quality_score', ascending=False)
+    
+    print(f"✅ Calculated quality scores for {len(quality_df)} features")
+    print(f"\n   Top 5 Features by Quality Score:")
+    for idx, row in quality_df.head(5).iterrows():
+        print(f"      #{idx+1}: {row['feature']}")
+        print(f"         Quality: {row['quality_score']:.3f}, Importance: {row['importance']:.3f}, "
+              f"Stability: {row['stability_score']:.3f}, AUC: {row['univariate_auc']:.3f}")
+    
+    return quality_df
+
+
+def create_advanced_feature_analysis_report(X_raw, y, importance_df, best_pipeline, 
+                                            diagnosis_code, viz_folder, top_n=20):
+    """
+    Create comprehensive feature analysis with focus on efficiency.
+    
+    Strategy:
+    1. Global stats on ALL features (fast)
+    2. Detailed analysis ONLY on top N features (slow but focused)
+    3. Distribution plots ONLY for top 10-12 features
+    """
+    print("\n" + "=" * 70)
+    print(f"ADVANCED FEATURE ANALYSIS FOR {diagnosis_code}")
+    print("=" * 70)
+    print(f"   Strategy: Global stats (all features) + Deep dive (top {top_n})")
+    
+    # 1. FAST: Global statistics on all features
+    all_feature_names = X_raw.columns.tolist()
+    global_df = analyze_global_feature_statistics(X_raw, all_feature_names)
+    
+    # 2. FOCUSED: Detailed analysis on top N features only
+    top_features = importance_df.head(top_n)['feature'].tolist()
+    
+    print(f"\n{'='*70}")
+    print(f"DEEP DIVE ANALYSIS: Top {len(top_features)} Features")
+    print(f"{'='*70}")
+    
+    stability_df = analyze_feature_stability(X_raw, y, top_features, best_pipeline)
+    univariate_df = analyze_univariate_power(X_raw, y, top_features)
+    
+    # 3. Calculate quality scores
+    quality_df = calculate_feature_quality_score(stability_df, univariate_df, importance_df, global_df)
+    
+    # Save comprehensive CSVs
+    csv_path = f'{viz_folder}/feature_analysis_complete.csv'
+    quality_df.to_csv(csv_path, index=False)
+    print(f"\n✅ Saved detailed analysis: {csv_path}")
+    
+    global_csv_path = f'{viz_folder}/global_feature_stats.csv'
+    global_df.to_csv(global_csv_path, index=False)
+    print(f"✅ Saved global stats: {global_csv_path}")
+    
+    # Create visualizations (focused on top features)
+    create_feature_quality_dashboard(quality_df, stability_df, univariate_df, 
+                                     global_df, diagnosis_code, viz_folder, top_n=min(20, len(quality_df)))
+    
+    # Distribution grid only for top 10 features
+    create_feature_distribution_grid(X_raw, y, quality_df.head(10)['feature'].tolist(), 
+                                    diagnosis_code, viz_folder)
+    
+    create_feature_executive_summary(quality_df, diagnosis_code, viz_folder)
+    
+    return quality_df
+
+
+def create_feature_quality_dashboard(quality_df, stability_df, univariate_df, 
+                                     global_df, diagnosis_code, viz_folder, top_n=20):
+    """
+    Create comprehensive dashboard showing all feature quality metrics.
+    """
+    print(f"\n📊 Creating feature quality dashboard...")
+    
+    top_features_df = quality_df.head(top_n)
+    
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(4, 3, hspace=0.35, wspace=0.3)
+    
+    # Overall title
+    fig.suptitle(f'Comprehensive Feature Quality Analysis: {diagnosis_code}\nTop {top_n} Features', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    
+    # 1. Feature Quality Score (composite metric)
+    ax1 = fig.add_subplot(gs[0, :])
+    colors_quality = plt.cm.RdYlGn(top_features_df['quality_score'] / top_features_df['quality_score'].max())
+    bars1 = ax1.barh(range(len(top_features_df)), top_features_df['quality_score'], color=colors_quality)
+    ax1.set_yticks(range(len(top_features_df)))
+    ax1.set_yticklabels(top_features_df['feature'], fontsize=9)
+    ax1.set_xlabel('Composite Quality Score (0-1)', fontsize=11, fontweight='bold')
+    ax1.set_title('🏆 Overall Feature Quality Ranking\n(40% Importance + 30% Stability + 30% Univariate Power)', 
+                  fontsize=13, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    for i, (bar, val) in enumerate(zip(bars1, top_features_df['quality_score'])):
+        ax1.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=8, fontweight='bold')
+    
+    # 2. Model Importance
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.barh(range(len(top_features_df)), top_features_df['importance'], color='steelblue', alpha=0.7)
+    ax2.set_yticks(range(len(top_features_df)))
+    ax2.set_yticklabels(top_features_df['feature'], fontsize=8)
+    ax2.set_xlabel('Importance', fontsize=10, fontweight='bold')
+    ax2.set_title('Model Feature Importance\n(From trained model)', fontsize=11, fontweight='bold')
+    ax2.grid(axis='x', alpha=0.3)
+    ax2.invert_yaxis()
+    
+    # 3. Stability Score
+    ax3 = fig.add_subplot(gs[1, 1])
+    colors_stability = ['green' if s > 0.8 else 'orange' if s > 0.6 else 'red' 
+                       for s in top_features_df['stability_score']]
+    ax3.barh(range(len(top_features_df)), top_features_df['stability_score'], 
+            color=colors_stability, alpha=0.7)
+    ax3.set_yticks(range(len(top_features_df)))
+    ax3.set_yticklabels(top_features_df['feature'], fontsize=8)
+    ax3.set_xlabel('Stability Score', fontsize=10, fontweight='bold')
+    ax3.set_title('Cross-Fold Stability\n(Consistency across CV folds)', fontsize=11, fontweight='bold')
+    ax3.grid(axis='x', alpha=0.3)
+    ax3.invert_yaxis()
+    
+    # 4. Univariate AUC
+    ax4 = fig.add_subplot(gs[1, 2])
+    colors_auc = plt.cm.RdYlGn((top_features_df['univariate_auc'] - 0.5) * 2)  # Scale 0.5-1.0 to 0-1
+    ax4.barh(range(len(top_features_df)), top_features_df['univariate_auc'], color=colors_auc, alpha=0.7)
+    ax4.set_yticks(range(len(top_features_df)))
+    ax4.set_yticklabels(top_features_df['feature'], fontsize=8)
+    ax4.set_xlabel('Univariate ROC-AUC', fontsize=10, fontweight='bold')
+    ax4.set_title('Individual Discriminative Power\n(Feature alone)', fontsize=11, fontweight='bold')
+    ax4.axvline(x=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+    ax4.grid(axis='x', alpha=0.3)
+    ax4.invert_yaxis()
+    
+    # 5. Scatter: Quality vs Importance
+    ax5 = fig.add_subplot(gs[2, 0])
+    scatter = ax5.scatter(top_features_df['importance'], top_features_df['quality_score'],
+                         c=top_features_df['stability_score'], cmap='RdYlGn', 
+                         s=100, alpha=0.7, edgecolors='black', linewidth=1)
+    ax5.set_xlabel('Model Importance', fontsize=10, fontweight='bold')
+    ax5.set_ylabel('Quality Score', fontsize=10, fontweight='bold')
+    ax5.set_title('Quality vs Importance\n(colored by stability)', fontsize=11, fontweight='bold')
+    ax5.grid(alpha=0.3)
+    plt.colorbar(scatter, ax=ax5, label='Stability')
+    
+    # 6. Scatter: Stability vs Univariate
+    ax6 = fig.add_subplot(gs[2, 1])
+    scatter2 = ax6.scatter(top_features_df['univariate_auc'], top_features_df['stability_score'],
+                          c=top_features_df['importance'], cmap='viridis',
+                          s=100, alpha=0.7, edgecolors='black', linewidth=1)
+    ax6.set_xlabel('Univariate AUC', fontsize=10, fontweight='bold')
+    ax6.set_ylabel('Stability Score', fontsize=10, fontweight='bold')
+    ax6.set_title('Stability vs Discriminative Power\n(colored by importance)', fontsize=11, fontweight='bold')
+    ax6.grid(alpha=0.3)
+    plt.colorbar(scatter2, ax=ax6, label='Importance')
+    
+    # 7. Radar/Spider chart for top 5 features
+    ax7 = fig.add_subplot(gs[2, 2], projection='polar')
+    top5 = top_features_df.head(5)
+    
+    categories = ['Importance', 'Stability', 'Univariate\nAUC']
+    N = len(categories)
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+    angles += angles[:1]
+    
+    for idx, row in top5.iterrows():
+        values = [
+            row['importance_norm'],
+            row['stability_norm'],
+            row['univariate_norm']
+        ]
+        values += values[:1]
+        ax7.plot(angles, values, 'o-', linewidth=2, label=row['feature'][:15])
+        ax7.fill(angles, values, alpha=0.15)
+    
+    ax7.set_xticks(angles[:-1])
+    ax7.set_xticklabels(categories, fontsize=9)
+    ax7.set_ylim(0, 1)
+    ax7.set_title('Top 5 Features Profile\n(Normalized metrics)', fontsize=11, fontweight='bold', pad=20)
+    ax7.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=8)
+    ax7.grid(True)
+    
+    # 8. Data Quality (missingness) - GLOBAL metric
+    ax8 = fig.add_subplot(gs[3, :2])
+    
+    # Merge with global data quality stats
+    quality_merged = top_features_df.copy()
+    if global_df is not None:
+        quality_dict = dict(zip(global_df['feature'], global_df['data_quality']))
+        quality_merged['data_quality_pct'] = quality_merged['feature'].map(quality_dict).fillna(1.0) * 100
+    else:
+        quality_merged['data_quality_pct'] = 100.0
+    
+    quality_merged = quality_merged.head(15)  # Top 15 for readability
+    
+    colors_quality = ['green' if q > 90 else 'orange' if q > 75 else 'red' 
+                     for q in quality_merged['data_quality_pct']]
+    ax8.barh(range(len(quality_merged)), quality_merged['data_quality_pct'], color=colors_quality, alpha=0.7)
+    ax8.set_yticks(range(len(quality_merged)))
+    ax8.set_yticklabels(quality_merged['feature'], fontsize=8)
+    ax8.set_xlabel('Data Completeness (%)', fontsize=10, fontweight='bold')
+    ax8.set_title('Feature Data Quality\n(% non-missing values)', 
+                 fontsize=11, fontweight='bold')
+    ax8.axvline(x=75, color='orange', linestyle='--', alpha=0.7, linewidth=2, label='75%')
+    ax8.axvline(x=90, color='green', linestyle='--', alpha=0.7, linewidth=2, label='90%')
+    ax8.set_xlim([0, 105])
+    ax8.grid(axis='x', alpha=0.3)
+    ax8.legend(fontsize=8)
+    ax8.invert_yaxis()
+    
+    # 9. Feature ranking comparison
+    ax9 = fig.add_subplot(gs[3, 2])
+    top10 = top_features_df.head(10)
+    
+    # Create ranking comparison
+    x = np.arange(len(top10))
+    width = 0.25
+    
+    # Rank by each metric (lower rank = better)
+    importance_ranks = top10['importance'].rank(ascending=False, method='min')
+    stability_ranks = top10['stability_score'].rank(ascending=False, method='min')
+    univariate_ranks = top10['univariate_auc'].rank(ascending=False, method='min')
+    
+    ax9.barh(x - width, importance_ranks, width, label='Importance Rank', alpha=0.8, color='steelblue')
+    ax9.barh(x, stability_ranks, width, label='Stability Rank', alpha=0.8, color='orange')
+    ax9.barh(x + width, univariate_ranks, width, label='Univariate Rank', alpha=0.8, color='green')
+    
+    ax9.set_yticks(x)
+    ax9.set_yticklabels(top10['feature'], fontsize=8)
+    ax9.set_xlabel('Rank (lower = better)', fontsize=10, fontweight='bold')
+    ax9.set_title('Ranking Comparison\n(Top 10 features)', fontsize=11, fontweight='bold')
+    ax9.legend(fontsize=8)
+    ax9.invert_yaxis()
+    ax9.invert_xaxis()
+    ax9.grid(axis='x', alpha=0.3)
+    
+    plt.savefig(f'{viz_folder}/6_feature_quality_dashboard.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/6_feature_quality_dashboard.png")
+    plt.close()
+
+
+def create_feature_distribution_grid(X_raw, y, top_features, diagnosis_code, viz_folder):
+    """
+    Create grid of distribution plots for top features showing class separation.
+    """
+    print(f"\n📊 Creating feature distribution grid...")
+    
+    from sklearn.impute import SimpleImputer
+    
+    n_features = min(12, len(top_features))
+    features_to_plot = top_features[:n_features]
+    
+    n_cols = 4
+    n_rows = int(np.ceil(n_features / n_cols))
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 4*n_rows))
+    axes = axes.flatten() if n_features > 1 else [axes]
+    
+    fig.suptitle(f'Feature Distributions by Class: {diagnosis_code}\nTop {n_features} Features', 
+                 fontsize=15, fontweight='bold', y=0.998)
+    
+    class_labels = y.unique()
+    colors = ['steelblue', 'coral']
+    
+    for idx, feature in enumerate(features_to_plot):
+        ax = axes[idx]
+        
+        # Impute missing values
+        feature_values = X_raw[feature].values.reshape(-1, 1)
+        imputer = SimpleImputer(strategy='median')
+        feature_imputed = imputer.fit_transform(feature_values).ravel()
+        
+        # Split by class
+        for class_idx, class_label in enumerate(class_labels):
+            class_data = feature_imputed[y == class_label]
+            ax.hist(class_data, bins=30, alpha=0.6, label=f'Class {class_label}', 
+                   color=colors[class_idx], edgecolor='black', linewidth=0.5)
+        
+        ax.set_xlabel('Value', fontsize=9)
+        ax.set_ylabel('Frequency', fontsize=9)
+        ax.set_title(f'{feature}', fontsize=10, fontweight='bold')
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+    
+    # Hide unused subplots
+    for idx in range(n_features, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(f'{viz_folder}/7_feature_distributions.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/7_feature_distributions.png")
+    plt.close()
+
+
+def create_feature_executive_summary(quality_df, diagnosis_code, viz_folder):
+    """
+    Create single-page executive summary of best features for presentation.
+    """
+    print(f"\n📊 Creating executive summary...")
+    
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+    
+    fig.suptitle(f'Feature Analysis Executive Summary: {diagnosis_code}\nBest Features for Prediction', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    
+    top10 = quality_df.head(10)
+    
+    # 1. Top 10 Features (left, spans 2 rows)
+    ax1 = fig.add_subplot(gs[:2, 0])
+    colors = plt.cm.RdYlGn(top10['quality_score'] / top10['quality_score'].max())
+    bars = ax1.barh(range(len(top10)), top10['quality_score'], color=colors)
+    ax1.set_yticks(range(len(top10)))
+    ax1.set_yticklabels([f"#{i+1}: {feat}" for i, feat in enumerate(top10['feature'])], fontsize=11)
+    ax1.set_xlabel('Quality Score', fontsize=12, fontweight='bold')
+    ax1.set_title('🏆 Top 10 Features\n(Ranked by composite quality)', fontsize=14, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    
+    for i, (bar, val) in enumerate(zip(bars, top10['quality_score'])):
+        ax1.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=10, fontweight='bold')
+    
+    # 2. Metrics comparison table (top right)
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.axis('off')
+    
+    table_data = []
+    for _, row in top10.head(5).iterrows():
+        table_data.append([
+            row['feature'][:20],
+            f"{row['importance']:.3f}",
+            f"{row['stability_score']:.3f}",
+            f"{row['univariate_auc']:.3f}"
+        ])
+    
+    table = ax2.table(cellText=table_data,
+                     colLabels=['Feature', 'Importance', 'Stability', 'Univ. AUC'],
+                     cellLoc='center',
+                     loc='center',
+                     bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2)
+    
+    # Style header
+    for i in range(4):
+        table[(0, i)].set_facecolor('#4CAF50')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Alternate row colors
+    for i in range(1, len(table_data) + 1):
+        for j in range(4):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#f0f0f0')
+    
+    ax2.set_title('Top 5 Features - Detailed Metrics', fontsize=13, fontweight='bold', pad=20)
+    
+    # 3. Quality score components breakdown (middle right)
+    ax3 = fig.add_subplot(gs[1, 1])
+    
+    metrics = ['Importance', 'Stability', 'Univ. AUC']
+    weights = [0.4, 0.3, 0.3]
+    colors_pie = ['#FF6B6B', '#4ECDC4', '#45B7D1']
+    
+    wedges, texts, autotexts = ax3.pie(weights, labels=metrics, colors=colors_pie,
+                                        autopct='%1.0f%%', startangle=90,
+                                        textprops={'fontsize': 11, 'fontweight': 'bold'})
+    ax3.set_title('Quality Score Components\n(Weighting scheme)', fontsize=13, fontweight='bold')
+    
+    # 4. Key insights (bottom, full width)
+    ax4 = fig.add_subplot(gs[2, :])
+    ax4.axis('off')
+    
+    # Calculate insights
+    n_highly_stable = (quality_df['stability_score'] > 0.8).sum()
+    avg_univariate_auc = quality_df['univariate_auc'].mean()
+    avg_data_quality = quality_df['data_quality'].mean() * 100
+    best_feature = quality_df.iloc[0]['feature']
+    best_score = quality_df.iloc[0]['quality_score']
+    
+    insights_text = f"""
+    📊 KEY INSIGHTS FOR {diagnosis_code}:
+    
+    ✅ Best Feature: {best_feature} (Quality Score: {best_score:.3f})
+    
+    🎯 Feature Statistics:
+       • Features analyzed (deep dive): {len(quality_df)}
+       • Highly stable features (score > 0.8): {n_highly_stable}
+       • Average univariate AUC: {avg_univariate_auc:.3f}
+       • Average data completeness: {avg_data_quality:.1f}%
+    
+    💡 Quality Score Formula:
+       = 35% × Model Importance + 25% × Stability + 25% × Univariate Power + 15% × Data Quality
+    
+    🏆 Top 3 Recommendations:
+       1. {quality_df.iloc[0]['feature']} - {quality_df.iloc[0]['quality_score']:.3f}
+       2. {quality_df.iloc[1]['feature']} - {quality_df.iloc[1]['quality_score']:.3f}
+       3. {quality_df.iloc[2]['feature']} - {quality_df.iloc[2]['quality_score']:.3f}
+    
+    📈 These features combine:
+       • High predictive power in multivariate model
+       • Consistent importance across CV folds
+       • Strong individual discriminative ability
+       • High data completeness (minimal missingness)
+    """
+    
+    ax4.text(0.05, 0.5, insights_text, fontsize=11, family='monospace',
+            verticalalignment='center',
+            bbox=dict(boxstyle='round,pad=1', facecolor='lightyellow', alpha=0.8, edgecolor='gray', linewidth=2))
+    
+    plt.savefig(f'{viz_folder}/8_executive_summary.png', dpi=300, bbox_inches='tight')
+    print(f"   ✅ Saved: {viz_folder}/8_executive_summary.png")
+    plt.close()
+
+
+# =============================================================================
 # Step 10: Comparative Analysis Across All Diagnoses
 # =============================================================================
 
@@ -2133,6 +2784,12 @@ def main():
                         top_n_features=20, diagnosis_code=dx_code
                     )
                 
+                # Advanced feature analysis (NEW!)
+                quality_df = create_advanced_feature_analysis_report(
+                    X_raw, y, importance_df, best_pipeline, 
+                    dx_code, viz_folder, top_n=20
+                )
+                
                 # Create advanced visualizations
                 create_advanced_visualizations(
                     X_refined, y, y_pred, y_pred_proba, 
@@ -2177,8 +2834,8 @@ def main():
         print(f"   - 2_refined_comparison.png")
         print(f"   - summary_statistics.csv")
         print(f"\n   Each diagnosis folder contains:")
-        print(f"   - 0_all_models_comparison.png (NEW!)")
-        print(f"   - 0_best_model_summary.png (NEW!)")
+        print(f"   - 0_all_models_comparison.png")
+        print(f"   - 0_best_model_summary.png")
         print(f"   - initial_feature_importances.png")
         print(f"   - initial_correlation_heatmap.png")
         print(f"   - 1_refined_feature_importance.png")
@@ -2186,6 +2843,10 @@ def main():
         print(f"   - 3_feature_distributions.png")
         print(f"   - 4_calibration_analysis.png")
         print(f"   - 5_performance_curves.png")
+        print(f"   - 6_feature_quality_dashboard.png (NEW! Advanced metrics)")
+        print(f"   - 7_feature_distributions.png (NEW! Class separation)")
+        print(f"   - 8_executive_summary.png (NEW! Presentation-ready)")
+        print(f"   - feature_analysis_complete.csv (NEW! All quality metrics)")
         print(f"   - refined_model_results.csv")
         
         print("\n" + "=" * 70)
