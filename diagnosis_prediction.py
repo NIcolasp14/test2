@@ -2666,6 +2666,635 @@ def create_comparative_analysis(all_diagnosis_results, all_refined_results, all_
 # Main Execution
 # =============================================================================
 
+def create_final_feature_report(all_feature_importances):
+    """
+    Create comprehensive cross-diagnosis feature aggregation and visualizations.
+    
+    Aggregates features at 3 levels: Top 20, Top 50, Top 100
+    For each level, saves:
+    - Detailed CSV with frequency, diagnosis codes, importance scores, sum
+    - Comprehensive visualizations comparing across levels
+    
+    All outputs saved to 'final_report/' folder
+    """
+    print("\n" + "=" * 70)
+    print("CREATING FINAL CROSS-DIAGNOSIS FEATURE REPORT")
+    print("=" * 70)
+    
+    if not all_feature_importances:
+        print("⚠️ No feature importances to analyze")
+        return
+    
+    # Create output folder
+    FINAL_REPORT_FOLDER = f"{BASE_VIZ_FOLDER}/final_report"
+    Path(FINAL_REPORT_FOLDER).mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n📁 Output folder: {FINAL_REPORT_FOLDER}/")
+    print(f"   Analyzing features from {len(all_feature_importances)} diagnoses")
+    
+    # Step 1: Collect ALL feature importances with full details
+    print("\n" + "=" * 70)
+    print("Step 1: Collecting Feature Importances from All Diagnoses")
+    print("=" * 70)
+    
+    feature_details = defaultdict(lambda: {
+        'diagnoses': [],
+        'importances': [],
+        'ranks': []  # Track what rank this feature had in each diagnosis
+    })
+    
+    for item in all_feature_importances:
+        dx = item['diagnosis']
+        importance_df = item['importance_df']
+        
+        if importance_df is not None and not importance_df.empty:
+            for rank, (_, row) in enumerate(importance_df.iterrows(), 1):
+                feature = row['feature']
+                importance = row['importance']
+                
+                feature_details[feature]['diagnoses'].append(dx)
+                feature_details[feature]['importances'].append(importance)
+                feature_details[feature]['ranks'].append(rank)
+    
+    print(f"✅ Collected {len(feature_details)} unique features across all diagnoses")
+    
+    # Step 2: Create aggregated datasets for Top 20, 50, 100
+    print("\n" + "=" * 70)
+    print("Step 2: Creating Aggregations for Top 20, Top 50, Top 100")
+    print("=" * 70)
+    
+    def create_aggregation(top_n):
+        """Create aggregation for features appearing in top N of any diagnosis"""
+        print(f"\n   Processing Top {top_n}...")
+        
+        aggregation = []
+        
+        for feature, details in feature_details.items():
+            # Check if this feature appeared in top N of any diagnosis
+            if any(rank <= top_n for rank in details['ranks']):
+                # Count how many times it appeared in top N
+                appearances_in_topN = sum(1 for rank in details['ranks'] if rank <= top_n)
+                
+                # Get importance scores only from diagnoses where it was in top N
+                topN_diagnoses = []
+                topN_importances = []
+                all_diagnoses = []
+                all_importances = []
+                
+                for dx, imp, rank in zip(details['diagnoses'], details['importances'], details['ranks']):
+                    all_diagnoses.append(dx)
+                    all_importances.append(imp)
+                    
+                    if rank <= top_n:
+                        topN_diagnoses.append(dx)
+                        topN_importances.append(imp)
+                
+                aggregation.append({
+                    'feature': feature,
+                    'frequency_in_topN': appearances_in_topN,
+                    'total_appearances': len(details['diagnoses']),
+                    'diagnosis_codes_topN': '; '.join(topN_diagnoses),
+                    'diagnosis_codes_all': '; '.join(all_diagnoses),
+                    'importance_scores_topN': '; '.join([f"{imp:.6f}" for imp in topN_importances]),
+                    'importance_scores_all': '; '.join([f"{imp:.6f}" for imp in all_importances]),
+                    'sum_importance_topN': sum(topN_importances),
+                    'sum_importance_all': sum(all_importances),
+                    'avg_importance_topN': np.mean(topN_importances),
+                    'avg_importance_all': np.mean(all_importances),
+                    'std_importance_topN': np.std(topN_importances),
+                    'std_importance_all': np.std(all_importances),
+                    'min_rank': min(details['ranks']),
+                    'max_rank': max(details['ranks']),
+                    'avg_rank': np.mean(details['ranks'])
+                })
+        
+        # Create DataFrame and sort by frequency in top N, then by sum of importances
+        df = pd.DataFrame(aggregation)
+        df = df.sort_values(['frequency_in_topN', 'sum_importance_topN'], ascending=[False, False])
+        
+        print(f"      ✅ {len(df)} features appeared in Top {top_n} of at least one diagnosis")
+        print(f"         Most frequent: {df.iloc[0]['feature']} ({df.iloc[0]['frequency_in_topN']} diagnoses)")
+        
+        return df
+    
+    # Create three aggregation levels
+    top20_df = create_aggregation(20)
+    top50_df = create_aggregation(50)
+    top100_df = create_aggregation(100)
+    
+    # Step 3: Save CSVs
+    print("\n" + "=" * 70)
+    print("Step 3: Saving Detailed CSVs")
+    print("=" * 70)
+    
+    csv_files = {
+        'top20_features_aggregated.csv': top20_df,
+        'top50_features_aggregated.csv': top50_df,
+        'top100_features_aggregated.csv': top100_df
+    }
+    
+    for filename, df in csv_files.items():
+        filepath = f"{FINAL_REPORT_FOLDER}/{filename}"
+        df.to_csv(filepath, index=False)
+        print(f"✅ Saved: {filepath}")
+        print(f"   Rows: {len(df)}, Columns: {len(df.columns)}")
+    
+    # Step 4: Create comprehensive visualizations
+    print("\n" + "=" * 70)
+    print("Step 4: Creating Comprehensive Visualizations")
+    print("=" * 70)
+    
+    create_final_report_visualizations(top20_df, top50_df, top100_df, FINAL_REPORT_FOLDER)
+    
+    print("\n" + "=" * 70)
+    print("✅ FINAL FEATURE REPORT COMPLETE")
+    print("=" * 70)
+    print(f"\n📁 All outputs saved to: {FINAL_REPORT_FOLDER}/")
+    print(f"\n📄 CSV Files:")
+    print(f"   - top20_features_aggregated.csv ({len(top20_df)} features)")
+    print(f"   - top50_features_aggregated.csv ({len(top50_df)} features)")
+    print(f"   - top100_features_aggregated.csv ({len(top100_df)} features)")
+    print(f"\n📊 Visualizations:")
+    print(f"   - 1_frequency_comparison.png")
+    print(f"   - 2_importance_comparison.png")
+    print(f"   - 3_top_features_detailed.png")
+    print(f"   - 4_rank_analysis.png")
+    print(f"   - 5_comprehensive_dashboard.png")
+
+
+def create_final_report_visualizations(top20_df, top50_df, top100_df, output_folder):
+    """
+    Create comprehensive visualizations comparing Top 20, 50, 100 aggregations.
+    """
+    print("\n📊 Generating visualizations...")
+    
+    # === VISUALIZATION 1: Frequency Comparison ===
+    print("   Creating 1_frequency_comparison.png...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    fig.suptitle('Feature Frequency Analysis: Top 20 vs Top 50 vs Top 100', 
+                 fontsize=16, fontweight='bold')
+    
+    # 1.1: Top 15 features by frequency in Top 20
+    ax1 = axes[0, 0]
+    top15_freq = top20_df.nlargest(15, 'frequency_in_topN')
+    colors = plt.cm.Reds(top15_freq['frequency_in_topN'] / top15_freq['frequency_in_topN'].max())
+    ax1.barh(range(len(top15_freq)), top15_freq['frequency_in_topN'], color=colors)
+    ax1.set_yticks(range(len(top15_freq)))
+    ax1.set_yticklabels(top15_freq['feature'], fontsize=9)
+    ax1.set_xlabel('Frequency (# diagnoses)', fontweight='bold')
+    ax1.set_title('Top 15 Features by Frequency in Top 20', fontweight='bold')
+    ax1.invert_yaxis()
+    ax1.grid(axis='x', alpha=0.3)
+    
+    # Add value labels
+    for i, val in enumerate(top15_freq['frequency_in_topN']):
+        ax1.text(val + 0.1, i, str(int(val)), va='center', fontweight='bold')
+    
+    # 1.2: Comparison across levels (top 10 features)
+    ax2 = axes[0, 1]
+    top10_features = top20_df.head(10)['feature'].tolist()
+    
+    freq_comparison = []
+    for feat in top10_features:
+        freq_20 = top20_df[top20_df['feature'] == feat]['frequency_in_topN'].values[0] if feat in top20_df['feature'].values else 0
+        freq_50 = top50_df[top50_df['feature'] == feat]['frequency_in_topN'].values[0] if feat in top50_df['feature'].values else 0
+        freq_100 = top100_df[top100_df['feature'] == feat]['frequency_in_topN'].values[0] if feat in top100_df['feature'].values else 0
+        freq_comparison.append({'feature': feat, 'Top 20': freq_20, 'Top 50': freq_50, 'Top 100': freq_100})
+    
+    freq_comp_df = pd.DataFrame(freq_comparison)
+    x = np.arange(len(freq_comp_df))
+    width = 0.25
+    
+    ax2.barh(x - width, freq_comp_df['Top 20'], width, label='Top 20', color='#d62728', alpha=0.8)
+    ax2.barh(x, freq_comp_df['Top 50'], width, label='Top 50', color='#ff7f0e', alpha=0.8)
+    ax2.barh(x + width, freq_comp_df['Top 100'], width, label='Top 100', color='#2ca02c', alpha=0.8)
+    
+    ax2.set_yticks(x)
+    ax2.set_yticklabels(freq_comp_df['feature'], fontsize=9)
+    ax2.set_xlabel('Frequency', fontweight='bold')
+    ax2.set_title('Top 10 Features Across Cutoff Levels', fontweight='bold')
+    ax2.legend()
+    ax2.invert_yaxis()
+    ax2.grid(axis='x', alpha=0.3)
+    
+    # 1.3: Feature count distribution
+    ax3 = axes[1, 0]
+    level_stats = {
+        'Top 20': len(top20_df),
+        'Top 50': len(top50_df),
+        'Top 100': len(top100_df)
+    }
+    colors_bar = ['#d62728', '#ff7f0e', '#2ca02c']
+    bars = ax3.bar(level_stats.keys(), level_stats.values(), color=colors_bar, alpha=0.7, edgecolor='black', linewidth=2)
+    ax3.set_ylabel('Number of Unique Features', fontweight='bold')
+    ax3.set_title('Total Features Appearing in Each Level', fontweight='bold')
+    ax3.grid(axis='y', alpha=0.3)
+    
+    for bar, val in zip(bars, level_stats.values()):
+        ax3.text(bar.get_x() + bar.get_width()/2, val + val*0.02, str(val), 
+                ha='center', va='bottom', fontweight='bold', fontsize=12)
+    
+    # 1.4: Frequency distribution histogram
+    ax4 = axes[1, 1]
+    ax4.hist(top20_df['frequency_in_topN'], bins=15, alpha=0.7, label='Top 20', color='#d62728', edgecolor='black')
+    ax4.hist(top50_df['frequency_in_topN'], bins=15, alpha=0.5, label='Top 50', color='#ff7f0e', edgecolor='black')
+    ax4.hist(top100_df['frequency_in_topN'], bins=15, alpha=0.3, label='Top 100', color='#2ca02c', edgecolor='black')
+    ax4.set_xlabel('Frequency (# diagnoses)', fontweight='bold')
+    ax4.set_ylabel('Number of Features', fontweight='bold')
+    ax4.set_title('Distribution of Feature Frequencies', fontweight='bold')
+    ax4.legend()
+    ax4.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_folder}/1_frequency_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("      ✅ Saved 1_frequency_comparison.png")
+    
+    # === VISUALIZATION 2: Importance Comparison ===
+    print("   Creating 2_importance_comparison.png...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    fig.suptitle('Feature Importance Analysis: Sum and Average', 
+                 fontsize=16, fontweight='bold')
+    
+    # 2.1: Top 15 by sum of importances (Top 20 level)
+    ax1 = axes[0, 0]
+    top15_sum = top20_df.nlargest(15, 'sum_importance_topN')
+    colors = plt.cm.Oranges(top15_sum['sum_importance_topN'] / top15_sum['sum_importance_topN'].max())
+    ax1.barh(range(len(top15_sum)), top15_sum['sum_importance_topN'], color=colors)
+    ax1.set_yticks(range(len(top15_sum)))
+    ax1.set_yticklabels(top15_sum['feature'], fontsize=9)
+    ax1.set_xlabel('Sum of Importances', fontweight='bold')
+    ax1.set_title('Top 15 Features by Sum of Importances (Top 20)', fontweight='bold')
+    ax1.invert_yaxis()
+    ax1.grid(axis='x', alpha=0.3)
+    
+    # 2.2: Top 15 by average importance (Top 20 level)
+    ax2 = axes[0, 1]
+    top15_avg = top20_df.nlargest(15, 'avg_importance_topN')
+    ax2.barh(range(len(top15_avg)), top15_avg['avg_importance_topN'], 
+            xerr=top15_avg['std_importance_topN'], color=plt.cm.Greens(0.7), capsize=3)
+    ax2.set_yticks(range(len(top15_avg)))
+    ax2.set_yticklabels(top15_avg['feature'], fontsize=9)
+    ax2.set_xlabel('Average Importance ± Std', fontweight='bold')
+    ax2.set_title('Top 15 Features by Average Importance (Top 20)', fontweight='bold')
+    ax2.invert_yaxis()
+    ax2.grid(axis='x', alpha=0.3)
+    
+    # 2.3: Sum comparison across levels
+    ax3 = axes[1, 0]
+    top10_features = top20_df.head(10)['feature'].tolist()
+    
+    sum_comparison = []
+    for feat in top10_features:
+        sum_20 = top20_df[top20_df['feature'] == feat]['sum_importance_topN'].values[0] if feat in top20_df['feature'].values else 0
+        sum_50 = top50_df[top50_df['feature'] == feat]['sum_importance_topN'].values[0] if feat in top50_df['feature'].values else 0
+        sum_100 = top100_df[top100_df['feature'] == feat]['sum_importance_topN'].values[0] if feat in top100_df['feature'].values else 0
+        sum_comparison.append({'feature': feat, 'Top 20': sum_20, 'Top 50': sum_50, 'Top 100': sum_100})
+    
+    sum_comp_df = pd.DataFrame(sum_comparison)
+    x = np.arange(len(sum_comp_df))
+    width = 0.25
+    
+    ax3.barh(x - width, sum_comp_df['Top 20'], width, label='Top 20', color='#d62728', alpha=0.8)
+    ax3.barh(x, sum_comp_df['Top 50'], width, label='Top 50', color='#ff7f0e', alpha=0.8)
+    ax3.barh(x + width, sum_comp_df['Top 100'], width, label='Top 100', color='#2ca02c', alpha=0.8)
+    
+    ax3.set_yticks(x)
+    ax3.set_yticklabels(sum_comp_df['feature'], fontsize=9)
+    ax3.set_xlabel('Sum of Importances', fontweight='bold')
+    ax3.set_title('Sum of Importances: Top 10 Features Across Levels', fontweight='bold')
+    ax3.legend()
+    ax3.invert_yaxis()
+    ax3.grid(axis='x', alpha=0.3)
+    
+    # 2.4: Scatter: Frequency vs Sum of Importances
+    ax4 = axes[1, 1]
+    ax4.scatter(top20_df['frequency_in_topN'], top20_df['sum_importance_topN'], 
+               alpha=0.6, s=100, c='#d62728', label='Top 20', edgecolors='black')
+    ax4.scatter(top50_df['frequency_in_topN'], top50_df['sum_importance_topN'], 
+               alpha=0.4, s=80, c='#ff7f0e', label='Top 50', edgecolors='black')
+    ax4.scatter(top100_df['frequency_in_topN'], top100_df['sum_importance_topN'], 
+               alpha=0.2, s=60, c='#2ca02c', label='Top 100', edgecolors='black')
+    
+    ax4.set_xlabel('Frequency (# diagnoses)', fontweight='bold')
+    ax4.set_ylabel('Sum of Importances', fontweight='bold')
+    ax4.set_title('Frequency vs Total Importance', fontweight='bold')
+    ax4.legend()
+    ax4.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_folder}/2_importance_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("      ✅ Saved 2_importance_comparison.png")
+    
+    # === VISUALIZATION 3: Top Features Detailed View ===
+    print("   Creating 3_top_features_detailed.png...")
+    
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(3, 2, hspace=0.35, wspace=0.3)
+    
+    fig.suptitle('Detailed Analysis of Top 20 Most Important Features', 
+                 fontsize=16, fontweight='bold')
+    
+    top20_display = top20_df.head(20)
+    
+    # 3.1: Combined score (frequency × avg importance)
+    ax1 = fig.add_subplot(gs[0, :])
+    combined_score = top20_display['frequency_in_topN'] * top20_display['avg_importance_topN']
+    colors = plt.cm.RdYlGn(combined_score / combined_score.max())
+    bars = ax1.barh(range(len(top20_display)), combined_score, color=colors)
+    ax1.set_yticks(range(len(top20_display)))
+    ax1.set_yticklabels(top20_display['feature'], fontsize=10)
+    ax1.set_xlabel('Combined Score (Frequency × Avg Importance)', fontsize=12, fontweight='bold')
+    ax1.set_title('Top 20 Features: Overall Impact Score', fontsize=14, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.invert_yaxis()
+    
+    for i, (bar, val, freq) in enumerate(zip(bars, combined_score, top20_display['frequency_in_topN'])):
+        ax1.text(val + val*0.02, i, f'{val:.3f} (n={int(freq)})', 
+                va='center', fontsize=9, fontweight='bold')
+    
+    # 3.2: Frequency
+    ax2 = fig.add_subplot(gs[1, 0])
+    colors_freq = plt.cm.Blues(top20_display['frequency_in_topN'] / top20_display['frequency_in_topN'].max())
+    ax2.barh(range(len(top20_display)), top20_display['frequency_in_topN'], color=colors_freq)
+    ax2.set_yticks(range(len(top20_display)))
+    ax2.set_yticklabels(top20_display['feature'], fontsize=9)
+    ax2.set_xlabel('Frequency', fontweight='bold')
+    ax2.set_title('How Many Diagnoses Each Feature Appeared In', fontweight='bold')
+    ax2.invert_yaxis()
+    ax2.grid(axis='x', alpha=0.3)
+    
+    # 3.3: Sum of importances
+    ax3 = fig.add_subplot(gs[1, 1])
+    colors_sum = plt.cm.Oranges(top20_display['sum_importance_topN'] / top20_display['sum_importance_topN'].max())
+    ax3.barh(range(len(top20_display)), top20_display['sum_importance_topN'], color=colors_sum)
+    ax3.set_yticks(range(len(top20_display)))
+    ax3.set_yticklabels(top20_display['feature'], fontsize=9)
+    ax3.set_xlabel('Sum of Importances', fontweight='bold')
+    ax3.set_title('Cumulative Importance Across All Diagnoses', fontweight='bold')
+    ax3.invert_yaxis()
+    ax3.grid(axis='x', alpha=0.3)
+    
+    # 3.4: Average importance with std
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.barh(range(len(top20_display)), top20_display['avg_importance_topN'],
+            xerr=top20_display['std_importance_topN'], color=plt.cm.Greens(0.7), capsize=3)
+    ax4.set_yticks(range(len(top20_display)))
+    ax4.set_yticklabels(top20_display['feature'], fontsize=9)
+    ax4.set_xlabel('Average Importance ± Std', fontweight='bold')
+    ax4.set_title('Average Importance Across Diagnoses', fontweight='bold')
+    ax4.invert_yaxis()
+    ax4.grid(axis='x', alpha=0.3)
+    
+    # 3.5: Rank distribution
+    ax5 = fig.add_subplot(gs[2, 1])
+    ax5.barh(range(len(top20_display)), top20_display['min_rank'], 
+            color='lightblue', alpha=0.7, label='Min Rank')
+    ax5.barh(range(len(top20_display)), top20_display['avg_rank'], 
+            color='orange', alpha=0.7, label='Avg Rank')
+    ax5.set_yticks(range(len(top20_display)))
+    ax5.set_yticklabels(top20_display['feature'], fontsize=9)
+    ax5.set_xlabel('Rank (lower = better)', fontweight='bold')
+    ax5.set_title('Feature Ranking Statistics', fontweight='bold')
+    ax5.invert_yaxis()
+    ax5.invert_xaxis()  # Lower rank is better
+    ax5.legend()
+    ax5.grid(axis='x', alpha=0.3)
+    
+    plt.savefig(f'{output_folder}/3_top_features_detailed.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("      ✅ Saved 3_top_features_detailed.png")
+    
+    # === VISUALIZATION 4: Rank Analysis ===
+    print("   Creating 4_rank_analysis.png...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Feature Ranking Analysis Across Diagnoses', 
+                 fontsize=16, fontweight='bold')
+    
+    # 4.1: Best rank achieved
+    ax1 = axes[0, 0]
+    top15_rank = top20_df.nsmallest(15, 'min_rank')
+    colors = plt.cm.RdYlGn_r(top15_rank['min_rank'] / 20)  # Reverse: lower rank = greener
+    ax1.barh(range(len(top15_rank)), top15_rank['min_rank'], color=colors)
+    ax1.set_yticks(range(len(top15_rank)))
+    ax1.set_yticklabels(top15_rank['feature'], fontsize=9)
+    ax1.set_xlabel('Best Rank Achieved', fontweight='bold')
+    ax1.set_title('Top 15 Features by Best Ranking', fontweight='bold')
+    ax1.invert_yaxis()
+    ax1.invert_xaxis()  # Lower is better
+    ax1.grid(axis='x', alpha=0.3)
+    
+    # 4.2: Average rank
+    ax2 = axes[0, 1]
+    top15_avg_rank = top20_df.nsmallest(15, 'avg_rank')
+    ax2.barh(range(len(top15_avg_rank)), top15_avg_rank['avg_rank'], color=plt.cm.Purples(0.7))
+    ax2.set_yticks(range(len(top15_avg_rank)))
+    ax2.set_yticklabels(top15_avg_rank['feature'], fontsize=9)
+    ax2.set_xlabel('Average Rank', fontweight='bold')
+    ax2.set_title('Top 15 Features by Average Ranking', fontweight='bold')
+    ax2.invert_yaxis()
+    ax2.invert_xaxis()
+    ax2.grid(axis='x', alpha=0.3)
+    
+    # 4.3: Rank variability (max - min)
+    ax3 = axes[1, 0]
+    top20_df_copy = top20_df.copy()
+    top20_df_copy['rank_range'] = top20_df_copy['max_rank'] - top20_df_copy['min_rank']
+    top15_variability = top20_df_copy.nsmallest(15, 'rank_range')
+    colors_var = ['green' if r < 10 else 'orange' if r < 20 else 'red' 
+                  for r in top15_variability['rank_range']]
+    ax3.barh(range(len(top15_variability)), top15_variability['rank_range'], color=colors_var, alpha=0.7)
+    ax3.set_yticks(range(len(top15_variability)))
+    ax3.set_yticklabels(top15_variability['feature'], fontsize=9)
+    ax3.set_xlabel('Rank Variability (Max - Min)', fontweight='bold')
+    ax3.set_title('Most Consistent Features (low variability)', fontweight='bold')
+    ax3.invert_yaxis()
+    ax3.grid(axis='x', alpha=0.3)
+    
+    # 4.4: Distribution of minimum ranks
+    ax4 = axes[1, 1]
+    ax4.hist(top20_df['min_rank'], bins=20, color='skyblue', edgecolor='black', alpha=0.7)
+    ax4.axvline(top20_df['min_rank'].median(), color='red', linestyle='--', 
+               linewidth=2, label=f"Median: {top20_df['min_rank'].median():.1f}")
+    ax4.set_xlabel('Minimum Rank Achieved', fontweight='bold')
+    ax4.set_ylabel('Number of Features', fontweight='bold')
+    ax4.set_title('Distribution of Best Rankings', fontweight='bold')
+    ax4.legend()
+    ax4.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_folder}/4_rank_analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("      ✅ Saved 4_rank_analysis.png")
+    
+    # === VISUALIZATION 5: Comprehensive Dashboard ===
+    print("   Creating 5_comprehensive_dashboard.png...")
+    
+    fig = plt.figure(figsize=(24, 16))
+    gs = fig.add_gridspec(4, 3, hspace=0.4, wspace=0.3)
+    
+    fig.suptitle('Comprehensive Cross-Diagnosis Feature Analysis Dashboard', 
+                 fontsize=18, fontweight='bold')
+    
+    # Get top 12 for detailed display
+    top12 = top20_df.head(12)
+    
+    # 5.1: Frequency
+    ax1 = fig.add_subplot(gs[0, 0])
+    colors1 = plt.cm.Reds(top12['frequency_in_topN'] / top12['frequency_in_topN'].max())
+    ax1.barh(range(len(top12)), top12['frequency_in_topN'], color=colors1)
+    ax1.set_yticks(range(len(top12)))
+    ax1.set_yticklabels(top12['feature'], fontsize=9)
+    ax1.set_xlabel('Frequency', fontweight='bold')
+    ax1.set_title('A. Feature Frequency', fontweight='bold', fontsize=12)
+    ax1.invert_yaxis()
+    ax1.grid(axis='x', alpha=0.3)
+    
+    # 5.2: Sum of importances
+    ax2 = fig.add_subplot(gs[0, 1])
+    colors2 = plt.cm.Oranges(top12['sum_importance_topN'] / top12['sum_importance_topN'].max())
+    ax2.barh(range(len(top12)), top12['sum_importance_topN'], color=colors2)
+    ax2.set_yticks(range(len(top12)))
+    ax2.set_yticklabels(top12['feature'], fontsize=9)
+    ax2.set_xlabel('Sum of Importances', fontweight='bold')
+    ax2.set_title('B. Cumulative Importance', fontweight='bold', fontsize=12)
+    ax2.invert_yaxis()
+    ax2.grid(axis='x', alpha=0.3)
+    
+    # 5.3: Average importance
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.barh(range(len(top12)), top12['avg_importance_topN'],
+            xerr=top12['std_importance_topN'], color=plt.cm.Greens(0.7), capsize=2)
+    ax3.set_yticks(range(len(top12)))
+    ax3.set_yticklabels(top12['feature'], fontsize=9)
+    ax3.set_xlabel('Avg Importance ± Std', fontweight='bold')
+    ax3.set_title('C. Average Importance', fontweight='bold', fontsize=12)
+    ax3.invert_yaxis()
+    ax3.grid(axis='x', alpha=0.3)
+    
+    # 5.4: Combined score
+    ax4 = fig.add_subplot(gs[1, :])
+    combined = top12['frequency_in_topN'] * top12['avg_importance_topN']
+    colors4 = plt.cm.RdYlGn(combined / combined.max())
+    bars4 = ax4.barh(range(len(top12)), combined, color=colors4, edgecolor='black', linewidth=1.5)
+    ax4.set_yticks(range(len(top12)))
+    ax4.set_yticklabels(top12['feature'], fontsize=11, fontweight='bold')
+    ax4.set_xlabel('Combined Impact Score (Frequency × Avg Importance)', fontsize=12, fontweight='bold')
+    ax4.set_title('D. Overall Feature Impact (Top 12 Features)', fontweight='bold', fontsize=14)
+    ax4.invert_yaxis()
+    ax4.grid(axis='x', alpha=0.3)
+    
+    for i, (bar, val, freq) in enumerate(zip(bars4, combined, top12['frequency_in_topN'])):
+        ax4.text(val + val*0.02, i, f'{val:.3f} (n={int(freq)})', 
+                va='center', fontsize=10, fontweight='bold')
+    
+    # 5.5: Scatter matrix (frequency vs importance)
+    ax5 = fig.add_subplot(gs[2, 0])
+    scatter = ax5.scatter(top20_df['frequency_in_topN'], top20_df['avg_importance_topN'],
+                         s=top20_df['sum_importance_topN']*1000, 
+                         c=top20_df['frequency_in_topN'], cmap='viridis',
+                         alpha=0.6, edgecolors='black', linewidth=1.5)
+    ax5.set_xlabel('Frequency', fontweight='bold')
+    ax5.set_ylabel('Avg Importance', fontweight='bold')
+    ax5.set_title('E. Feature Landscape\n(size = sum importance)', fontweight='bold', fontsize=12)
+    ax5.grid(alpha=0.3)
+    plt.colorbar(scatter, ax=ax5, label='Frequency')
+    
+    # Annotate top 5
+    for idx, row in top20_df.head(5).iterrows():
+        ax5.annotate(row['feature'], 
+                    (row['frequency_in_topN'], row['avg_importance_topN']),
+                    xytext=(5, 5), textcoords='offset points',
+                    fontsize=8, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+    
+    # 5.6: Rank distribution
+    ax6 = fig.add_subplot(gs[2, 1])
+    ax6.barh(range(len(top12)), top12['min_rank'], color='lightblue', alpha=0.7, label='Best Rank')
+    ax6.barh(range(len(top12)), top12['avg_rank'], color='orange', alpha=0.7, label='Avg Rank')
+    ax6.set_yticks(range(len(top12)))
+    ax6.set_yticklabels(top12['feature'], fontsize=9)
+    ax6.set_xlabel('Rank (lower = better)', fontweight='bold')
+    ax6.set_title('F. Ranking Statistics', fontweight='bold', fontsize=12)
+    ax6.invert_yaxis()
+    ax6.invert_xaxis()
+    ax6.legend(fontsize=9)
+    ax6.grid(axis='x', alpha=0.3)
+    
+    # 5.7: Level comparison statistics
+    ax7 = fig.add_subplot(gs[2, 2])
+    level_data = {
+        'Total Features': [len(top20_df), len(top50_df), len(top100_df)],
+        'Avg Frequency': [top20_df['frequency_in_topN'].mean(), 
+                         top50_df['frequency_in_topN'].mean(),
+                         top100_df['frequency_in_topN'].mean()],
+        'Avg Sum Imp': [top20_df['sum_importance_topN'].mean(),
+                       top50_df['sum_importance_topN'].mean(),
+                       top100_df['sum_importance_topN'].mean()]
+    }
+    x_pos = np.arange(3)
+    width = 0.25
+    
+    ax7.bar(x_pos - width, level_data['Total Features'], width, label='Total Features', color='#d62728')
+    ax7_twin1 = ax7.twinx()
+    ax7_twin1.bar(x_pos, level_data['Avg Frequency'], width, label='Avg Frequency', color='#ff7f0e')
+    ax7_twin2 = ax7.twinx()
+    ax7_twin2.spines['right'].set_position(('outward', 60))
+    ax7_twin2.bar(x_pos + width, level_data['Avg Sum Imp'], width, label='Avg Sum Imp', color='#2ca02c')
+    
+    ax7.set_xticks(x_pos)
+    ax7.set_xticklabels(['Top 20', 'Top 50', 'Top 100'])
+    ax7.set_ylabel('Total Features', fontweight='bold', color='#d62728')
+    ax7_twin1.set_ylabel('Avg Frequency', fontweight='bold', color='#ff7f0e')
+    ax7_twin2.set_ylabel('Avg Sum Imp', fontweight='bold', color='#2ca02c')
+    ax7.set_title('G. Level Comparison', fontweight='bold', fontsize=12)
+    ax7.grid(axis='y', alpha=0.3)
+    
+    # 5.8: Key statistics panel
+    ax8 = fig.add_subplot(gs[3, :])
+    ax8.axis('off')
+    
+    stats_text = f"""
+    📊 KEY STATISTICS - CROSS-DIAGNOSIS FEATURE ANALYSIS
+    
+    🔝 TOP 20 LEVEL:
+       • Unique features: {len(top20_df)}
+       • Most frequent feature: {top20_df.iloc[0]['feature']} (appeared in {int(top20_df.iloc[0]['frequency_in_topN'])} diagnoses)
+       • Highest sum of importance: {top20_df.nlargest(1, 'sum_importance_topN').iloc[0]['feature']} (sum = {top20_df.nlargest(1, 'sum_importance_topN').iloc[0]['sum_importance_topN']:.4f})
+       • Average frequency per feature: {top20_df['frequency_in_topN'].mean():.2f} diagnoses
+       • Average importance per feature: {top20_df['avg_importance_topN'].mean():.4f}
+    
+    🔝 TOP 50 LEVEL:
+       • Unique features: {len(top50_df)}
+       • Average frequency per feature: {top50_df['frequency_in_topN'].mean():.2f} diagnoses
+       • Average importance per feature: {top50_df['avg_importance_topN'].mean():.4f}
+    
+    🔝 TOP 100 LEVEL:
+       • Unique features: {len(top100_df)}
+       • Average frequency per feature: {top100_df['frequency_in_topN'].mean():.2f} diagnoses
+       • Average importance per feature: {top100_df['avg_importance_topN'].mean():.4f}
+    
+    💡 INSIGHTS:
+       • {len([f for f in top20_df['feature'] if f in top50_df['feature'].values and f in top100_df['feature'].values])} features appear in all three levels
+       • Most consistent feature (lowest rank variability): {top20_df_copy.nsmallest(1, 'rank_range').iloc[0]['feature']}
+       • Best overall performer (highest combined score): {top20_df.iloc[0]['feature']}
+    """
+    
+    ax8.text(0.05, 0.95, stats_text, transform=ax8.transAxes, 
+            fontsize=11, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.savefig(f'{output_folder}/5_comprehensive_dashboard.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("      ✅ Saved 5_comprehensive_dashboard.png")
+    
+    print("\n✅ All visualizations created successfully!")
+
+
 def main():
     print("\n" + "=" * 70)
     print("INDIVIDUAL DIAGNOSIS PREDICTION FROM SDoH FEATURES")
@@ -2815,6 +3444,13 @@ def main():
         print("=" * 70)
         
         create_comparative_analysis(final_results, all_refined_results, all_feature_importances)
+        
+        # Step 9: Cross-Diagnosis Feature Aggregation & Final Report
+        print("\n" + "=" * 70)
+        print("Step 9: CROSS-DIAGNOSIS FEATURE AGGREGATION")
+        print("=" * 70)
+        
+        create_final_feature_report(all_feature_importances)
         
         # Final Summary
         print("\n" + "=" * 70)
