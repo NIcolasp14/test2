@@ -3,13 +3,14 @@ diagnosis_prediction.py
 
 Predict Diagnosis Presence from SDoH Features
 ----------------------------------------------
-Creates balanced prediction tasks using combinations of diagnoses.
-NO temporal leakage - diagnoses are separate from features.
+Optimized for large datasets with XGBoost and LightGBM.
+Uses advanced IterativeImputer (MICE) for better handling of missingness.
 
 Strategy:
 - Find patients in both full_acxiom.csv and diagnosis.csv
-- Create 10 random diagnosis combinations for balanced labels (~50% prevalence)
-- Run leakage-free CV on each combination
+- For each target diagnosis, create balanced prediction task
+- Run leakage-free CV with advanced imputation
+- Compare XGBoost vs LightGBM performance
 """
 
 import pandas as pd
@@ -20,10 +21,11 @@ import re
 import os
 from pathlib import Path
 from collections import defaultdict
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.impute import SimpleImputer
+from sklearn.experimental import enable_iterative_imputer  # Required to enable IterativeImputer
+from sklearn.impute import IterativeImputer
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import (
@@ -48,13 +50,6 @@ except ImportError:
     XGBOOST_AVAILABLE = False
     print("⚠️ XGBoost not available. Install with: pip install xgboost")
 
-try:
-    from catboost import CatBoostClassifier
-    CATBOOST_AVAILABLE = True
-except ImportError:
-    CATBOOST_AVAILABLE = False
-    print("⚠️ CatBoost not available. Install with: pip install catboost")
-
 
 # =============================================================================
 # Configuration
@@ -70,40 +65,15 @@ COMPARATIVE_FOLDER = "comparative_visualisations"
 Path(BASE_VIZ_FOLDER).mkdir(exist_ok=True)
 Path(COMPARATIVE_FOLDER).mkdir(exist_ok=True)
 
-# Target diagnosis codes (from user's list)
-TARGET_DIAGNOSES = [
-    'I10', 'E78.5', 'Z23', 'Z00.00', 'E78.2', 'Z12.11', 'Z79.899', 'Z13.31',
-    'K21.9', 'Z12.31', 'Z01.30', 'Z13.89', 'M25.13', 'M52.4', 'Z73.0',
-    'Z13.9', 'T91.81', 'E78.00', 'Z87.891', 'E55.9'
-]
+# Will test ALL diagnosis codes found in diagnosis.csv
+# No predefined target list - dynamic discovery
+TARGET_DIAGNOSES = None  # Will be populated from data
 
-# Model parameters (aggressive regularization)
+# Model parameters
 RANDOM_STATE = 42
 N_CV_FOLDS = 5
 
-RF_PARAMS = {
-    'n_estimators': 50,
-    'max_depth': 4,
-    'min_samples_split': 20,
-    'min_samples_leaf': 10,
-    'max_features': 'sqrt',
-    'random_state': RANDOM_STATE,
-    'n_jobs': -1,
-    'class_weight': 'balanced',
-    'max_samples': 0.7
-}
-
-GB_PARAMS = {
-    'n_estimators': 50,
-    'max_depth': 3,
-    'learning_rate': 0.01,
-    'min_samples_split': 20,
-    'min_samples_leaf': 10,
-    'max_features': 'sqrt',
-    'random_state': RANDOM_STATE,
-    'subsample': 0.7
-}
-
+# Preprocessing thresholds
 VARIANCE_THRESHOLD = 1e-5
 MISSING_THRESHOLD = 0.95
 
@@ -140,30 +110,139 @@ class ColumnDropper(BaseEstimator, TransformerMixin):
         return df[self.cols_to_keep_].values
 
 
-class ConditionalImputer(BaseEstimator, TransformerMixin):
-    """Choose KNNImputer for small feature sets, otherwise SimpleImputer.
-
-    This avoids the O(n_samples^2 * n_features) cost of KNNImputer on
-    high-dimensional data which can hang the pipeline.
+class AdvancedImputer(BaseEstimator, TransformerMixin):
     """
-    def __init__(self, knn_neighbors=5, feature_threshold=500):
-        self.knn_neighbors = knn_neighbors
-        self.feature_threshold = feature_threshold
+    Advanced imputation using IterativeImputer (MICE) with missingness indicators.
+    
+    This method:
+    - Uses multivariate imputation (models each feature from others)
+    - Adds binary indicators for missing values (preserves missingness signal)
+    - More sophisticated than median/KNN for large datasets with complex patterns
+    """
+    def __init__(self, max_iter=10, random_state=42):
+        self.max_iter = max_iter
+        self.random_state = random_state
         self.imputer_ = None
+        self.n_features_in_ = None
+        self.n_features_out_ = None
+        self.missing_indicator_indices_ = []
 
     def fit(self, X, y=None):
         X_arr = X if not isinstance(X, pd.DataFrame) else X.values
-        n_features = X_arr.shape[1]
-        if n_features <= self.feature_threshold:
-            self.imputer_ = KNNImputer(n_neighbors=self.knn_neighbors)
-        else:
-            self.imputer_ = SimpleImputer(strategy='median')
+        self.n_features_in_ = X_arr.shape[1]
+        
+        # IterativeImputer with missingness indicators
+        self.imputer_ = IterativeImputer(
+            max_iter=self.max_iter,
+            random_state=self.random_state,
+            add_indicator=True,  # Add binary indicators for missing values
+            verbose=0
+        )
+        
         self.imputer_.fit(X_arr)
+        X_transformed = self.imputer_.transform(X_arr)
+        self.n_features_out_ = X_transformed.shape[1]
+        
+        # Track which columns are missingness indicators
+        self.missing_indicator_indices_ = list(range(self.n_features_in_, self.n_features_out_))
+        
         return self
 
     def transform(self, X):
         X_arr = X if not isinstance(X, pd.DataFrame) else X.values
         return self.imputer_.transform(X_arr)
+
+
+class CategoricalEncoder(BaseEstimator, TransformerMixin):
+    """
+    Detect and encode categorical features (columns with letter values).
+    
+    For SDoH data, some fields use letter codes (e.g., 'k', 'l', 'm') instead of numbers.
+    This transformer:
+    1. Detects which columns have categorical values (non-numeric strings)
+    2. Label-encodes them to integers
+    3. Preserves numeric columns as-is
+    """
+    def __init__(self, categorical_threshold=0.05):
+        """
+        Args:
+            categorical_threshold: If >5% of non-null values are non-numeric strings,
+                                   treat column as categorical
+        """
+        self.categorical_threshold = categorical_threshold
+        self.categorical_cols_ = []
+        self.encoders_ = {}
+        self.feature_names_ = []
+    
+    def fit(self, X, y=None):
+        df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+        
+        self.categorical_cols_ = []
+        self.encoders_ = {}
+        
+        for col in df.columns:
+            # Try converting to numeric
+            numeric_series = pd.to_numeric(df[col], errors='coerce')
+            non_null = df[col].notna()
+            
+            if non_null.sum() == 0:
+                continue  # Empty column
+            
+            # Calculate what fraction became NaN after numeric conversion
+            became_nan = numeric_series.isna() & non_null
+            categorical_ratio = became_nan.sum() / non_null.sum()
+            
+            # If >threshold of values are non-numeric, treat as categorical
+            if categorical_ratio > self.categorical_threshold:
+                self.categorical_cols_.append(col)
+                
+                # Fit label encoder
+                from sklearn.preprocessing import LabelEncoder
+                encoder = LabelEncoder()
+                # Get non-null values
+                non_null_vals = df[col][non_null].astype(str)
+                encoder.fit(non_null_vals)
+                self.encoders_[col] = encoder
+        
+        self.feature_names_ = df.columns.tolist()
+        
+        if len(self.categorical_cols_) > 0:
+            print(f"   ℹ️  Detected {len(self.categorical_cols_)} categorical columns (with letter values)")
+            print(f"      Examples: {self.categorical_cols_[:5]}")
+        
+        return self
+    
+    def transform(self, X):
+        df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+        df.columns = self.feature_names_
+        
+        for col in df.columns:
+            if col in self.categorical_cols_:
+                # Label encode categorical column
+                encoder = self.encoders_[col]
+                non_null = df[col].notna()
+                
+                if non_null.sum() > 0:
+                    # Transform non-null values
+                    try:
+                        df.loc[non_null, col] = encoder.transform(df.loc[non_null, col].astype(str))
+                    except ValueError:
+                        # Unseen categories → assign -1
+                        transformed = []
+                        for val in df.loc[non_null, col].astype(str):
+                            if val in encoder.classes_:
+                                transformed.append(encoder.transform([val])[0])
+                            else:
+                                transformed.append(-1)  # Unknown category
+                        df.loc[non_null, col] = transformed
+                
+                # Convert to float (to allow NaN for missing values)
+                df[col] = df[col].astype(float)
+            else:
+                # Convert numeric column
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        return df.values
 
 
 def create_bridge_from_diagnosis_with_acxiom(bridge_path='diagnosis_with_acxiom.csv', out_path='id_bridge.csv'):
@@ -579,37 +658,43 @@ def extract_diagnosis_codes(diagnosis_df):
 # Step 3: Validate Target Diagnoses
 # =============================================================================
 
-def validate_target_diagnoses(diagnosis_prevalence, target_diagnoses, total_patients):
+def get_all_diagnoses_for_testing(diagnosis_prevalence, total_patients, min_samples=50):
     """
-    Validate which target diagnoses are available in the dataset.
+    Get ALL diagnosis codes from dataset for testing.
+    Filter only those with sufficient samples (min_samples).
     
     Returns:
-        List of valid diagnosis codes with their prevalence info
+        List of all diagnosis codes with their prevalence info
     """
     print("\n" + "=" * 70)
-    print("Step 3: Validating Target Diagnosis Codes")
+    print("Step 3: Extracting ALL Diagnosis Codes for Testing")
     print("=" * 70)
     
-    valid_diagnoses = []
+    all_diagnoses = []
     
-    print(f"\nChecking {len(target_diagnoses)} target diagnoses...")
+    print(f"\nFiltering diagnoses with at least {min_samples} samples...")
     
-    for dx_code in target_diagnoses:
-        if dx_code in diagnosis_prevalence.index:
-            count = diagnosis_prevalence[dx_code]
+    for dx_code, count in diagnosis_prevalence.items():
+        if count >= min_samples:
             prevalence = count / total_patients
-            valid_diagnoses.append({
+            all_diagnoses.append({
                 'code': dx_code,
                 'count': count,
                 'prevalence': prevalence
             })
-            print(f"  ✓ {dx_code}: {count} patients ({prevalence*100:.1f}%)")
-        else:
-            print(f"  ✗ {dx_code}: Not found in dataset")
     
-    print(f"\n✅ Found {len(valid_diagnoses)}/{len(target_diagnoses)} target diagnoses in dataset")
+    # Sort by prevalence (most common first)
+    all_diagnoses = sorted(all_diagnoses, key=lambda x: x['count'], reverse=True)
     
-    if len(valid_diagnoses) == 0:
+    print(f"\n✅ Found {len(all_diagnoses)} diagnoses with ≥{min_samples} samples")
+    print(f"\n📊 Top 20 most common diagnoses:")
+    for dx_info in all_diagnoses[:20]:
+        print(f"   {dx_info['code']}: {dx_info['count']} patients ({dx_info['prevalence']*100:.1f}%)")
+    
+    if len(all_diagnoses) == 0:
+        print(f"\n⚠️ WARNING: No diagnoses found with ≥{min_samples} samples!")
+    
+    return all_diagnoses
         print("\n⚠️ WARNING: No target diagnoses found!")
         print("Available diagnosis codes (top 20):")
         for dx, count in diagnosis_prevalence.head(20).items():
@@ -622,20 +707,53 @@ def validate_target_diagnoses(diagnosis_prevalence, target_diagnoses, total_pati
 # Step 4: Create Labels for Single Diagnosis
 # =============================================================================
 
-def create_labels_for_diagnosis(patient_ids, patient_diagnoses, diagnosis_code):
+def create_balanced_labels_for_diagnosis(patient_ids, patient_diagnoses, diagnosis_code, random_state=42):
     """
-    Create binary labels: 1 if patient has the specific diagnosis, 0 otherwise.
+    Create balanced binary labels by sampling equal numbers of positives and negatives.
+    
+    Strategy:
+    - Take ALL patients with the diagnosis (label=1)
+    - Randomly sample equal number of patients WITHOUT the diagnosis (label=0)
     
     Returns:
-        labels: Series with patient_id as index
+        labels: Series with patient_id as index (balanced 50/50)
+        selected_patient_ids: List of patient IDs in the balanced sample
     """
-    labels = {}
+    np.random.seed(random_state)
+    
+    # Separate positives and negatives
+    positive_ids = []
+    negative_ids = []
+    
     for patient_id in patient_ids:
         patient_dx = patient_diagnoses.get(patient_id, set())
-        has_diagnosis = diagnosis_code in patient_dx
-        labels[patient_id] = 1 if has_diagnosis else 0
+        if diagnosis_code in patient_dx:
+            positive_ids.append(patient_id)
+        else:
+            negative_ids.append(patient_id)
     
-    return pd.Series(labels)
+    n_positives = len(positive_ids)
+    n_negatives = len(negative_ids)
+    
+    # Check if we have enough samples
+    if n_positives == 0:
+        return None, None  # No positive samples
+    
+    if n_negatives < n_positives:
+        # Not enough negatives for balanced sampling - use all negatives and sample positives
+        selected_negatives = negative_ids
+        selected_positives = np.random.choice(positive_ids, size=n_negatives, replace=False).tolist()
+    else:
+        # Enough negatives - sample to match positives
+        selected_positives = positive_ids
+        selected_negatives = np.random.choice(negative_ids, size=n_positives, replace=False).tolist()
+    
+    # Combine and create labels
+    selected_patient_ids = selected_positives + selected_negatives
+    labels = {pid: 1 for pid in selected_positives}
+    labels.update({pid: 0 for pid in selected_negatives})
+    
+    return pd.Series(labels), selected_patient_ids
 
 
 # =============================================================================
@@ -713,129 +831,76 @@ def prepare_features(acxiom_df):
 
 def create_model_pipelines():
     """
-    Create pipelines with 2-3 hyperparameter configurations per model.
-    This provides alternatives in case one configuration fails or predicts one class.
+    Create optimized pipelines with only XGBoost and LightGBM (single config each).
+    Uses AdvancedImputer (IterativeImputer/MICE) for better handling of missingness.
     """
     models = {}
     
-    print("🔒 Creating leakage-free pipelines with hyperparameter variations...")
+    print("🔒 Creating optimized leakage-free pipelines...")
+    print("   Models: XGBoost + LightGBM (1 config each)")
+    print("   Imputation: IterativeImputer (MICE) with missingness indicators")
     print("   All preprocessing happens INSIDE cross-validation folds")
-    print("   Multiple configs per model for robustness")
     
-    # Random Forest - 3 configurations
-    rf_configs = [
-        ('Conservative', {'max_depth': 4, 'min_samples_leaf': 15, 'max_features': 'sqrt', 'n_estimators': 100}),
-        ('Moderate', {'max_depth': 6, 'min_samples_leaf': 10, 'max_features': 'sqrt', 'n_estimators': 100}),
-        ('Relaxed', {'max_depth': 8, 'min_samples_leaf': 5, 'max_features': 'sqrt', 'n_estimators': 100}),
-    ]
-    for name, config in rf_configs:
-        params = {
-            'random_state': RANDOM_STATE, 'n_jobs': -1, 'class_weight': 'balanced',
-            **config
-        }
-        models[f'RF-{name}'] = Pipeline([
-            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-            ('scaler', StandardScaler()),
-            ('model', RandomForestClassifier(**params))
-        ])
-    
-    # Gradient Boosting - 3 configurations
-    gb_configs = [
-        ('Conservative', {'max_depth': 3, 'learning_rate': 0.01, 'min_samples_leaf': 20, 'subsample': 0.7, 'n_estimators': 100}),
-        ('Moderate', {'max_depth': 4, 'learning_rate': 0.02, 'min_samples_leaf': 10, 'subsample': 0.8, 'n_estimators': 100}),
-        ('Relaxed', {'max_depth': 5, 'learning_rate': 0.03, 'min_samples_leaf': 5, 'subsample': 0.8, 'n_estimators': 100}),
-    ]
-    for name, config in gb_configs:
-        params = {
-            'random_state': RANDOM_STATE, 'validation_fraction': 0.1, 
-            'n_iter_no_change': 10, 'tol': 1e-4,
-            **config
-        }
-        models[f'GB-{name}'] = Pipeline([
-            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-            ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-            ('scaler', StandardScaler()),
-            ('model', GradientBoostingClassifier(**params))
-        ])
-    
-    # LightGBM - 3 configurations
-    if LIGHTGBM_AVAILABLE:
-        lgbm_configs = [
-            ('Conservative', {'max_depth': 3, 'learning_rate': 0.01, 'num_leaves': 15, 'min_child_samples': 30, 
-                            'subsample': 0.7, 'n_estimators': 100}),
-            ('Moderate', {'max_depth': 4, 'learning_rate': 0.02, 'num_leaves': 20, 'min_child_samples': 20, 
-                         'subsample': 0.8, 'n_estimators': 100}),
-            ('Relaxed', {'max_depth': 5, 'learning_rate': 0.03, 'num_leaves': 25, 'min_child_samples': 15, 
-                        'subsample': 0.8, 'n_estimators': 100}),
-        ]
-        for name, config in lgbm_configs:
-            params = {
-                'colsample_bytree': 0.7, 'reg_alpha': 0.1, 'reg_lambda': 1.0,
-                'random_state': RANDOM_STATE, 'n_jobs': -1, 'verbosity': -1, 
-                'class_weight': 'balanced',
-                **config
-            }
-            models[f'LGBM-{name}'] = Pipeline([
-                ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-                ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-                ('scaler', StandardScaler()),
-                ('model', lgb.LGBMClassifier(**params))
-            ])
-    
-    # XGBoost - 3 configurations
+    # XGBoost - Single optimized configuration
     if XGBOOST_AVAILABLE:
-        xgb_configs = [
-            ('Conservative', {'max_depth': 3, 'learning_rate': 0.01, 'min_child_weight': 15, 'subsample': 0.7, 
-                            'gamma': 0.3, 'n_estimators': 100}),
-            ('Moderate', {'max_depth': 4, 'learning_rate': 0.02, 'min_child_weight': 10, 'subsample': 0.8, 
-                         'gamma': 0.2, 'n_estimators': 100}),
-            ('Relaxed', {'max_depth': 5, 'learning_rate': 0.03, 'min_child_weight': 5, 'subsample': 0.8, 
-                        'gamma': 0.1, 'n_estimators': 100}),
-        ]
-        for name, config in xgb_configs:
-            params = {
-                'colsample_bytree': 0.7, 'reg_alpha': 0.1, 'reg_lambda': 1.5,
-                'random_state': RANDOM_STATE, 'n_jobs': -1, 'eval_metric': 'logloss',
-                **config
-            }
-            models[f'XGB-{name}'] = Pipeline([
-                ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-                ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-                ('scaler', StandardScaler()),
-                ('model', xgb.XGBClassifier(**params))
-            ])
+        xgb_params = {
+            'max_depth': 4,
+            'learning_rate': 0.02,
+            'min_child_weight': 10,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'gamma': 0.2,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.5,
+            'n_estimators': 150,
+            'random_state': RANDOM_STATE,
+            'n_jobs': -1,
+            'eval_metric': 'logloss',
+            'verbosity': 0
+        }
+        models['XGBoost'] = Pipeline([
+            ('categorical', CategoricalEncoder(categorical_threshold=0.05)),
+            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+            ('imputer', AdvancedImputer(max_iter=10, random_state=RANDOM_STATE)),
+            ('scaler', StandardScaler()),
+            ('model', xgb.XGBClassifier(**xgb_params))
+        ])
+        print("   ✓ XGBoost pipeline created")
+    else:
+        print("   ⚠️  XGBoost not available - skipping")
     
-    # CatBoost - 2 configurations (slower to train)
-    if CATBOOST_AVAILABLE:
-        catboost_configs = [
-            ('Conservative', {'depth': 4, 'learning_rate': 0.01, 'min_data_in_leaf': 20, 'l2_leaf_reg': 5, 
-                            'subsample': 0.7, 'iterations': 100}),
-            ('Moderate', {'depth': 5, 'learning_rate': 0.02, 'min_data_in_leaf': 10, 'l2_leaf_reg': 3, 
-                         'subsample': 0.8, 'iterations': 100}),
-        ]
-        for name, config in catboost_configs:
-            params = {
-                'random_state': RANDOM_STATE, 'verbose': False, 'thread_count': -1,
-                'auto_class_weights': 'Balanced', 'max_leaves': 16,
-                **config
-            }
-            models[f'CatBoost-{name}'] = Pipeline([
-                ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
-                ('imputer', ConditionalImputer(knn_neighbors=5, feature_threshold=500)),
-                ('scaler', StandardScaler()),
-                ('model', CatBoostClassifier(**params))
-            ])
+    # LightGBM - Single optimized configuration
+    if LIGHTGBM_AVAILABLE:
+        lgbm_params = {
+            'max_depth': 4,
+            'learning_rate': 0.02,
+            'num_leaves': 20,
+            'min_child_samples': 20,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'n_estimators': 150,
+            'random_state': RANDOM_STATE,
+            'n_jobs': -1,
+            'verbosity': -1,
+            'class_weight': 'balanced'
+        }
+        models['LightGBM'] = Pipeline([
+            ('categorical', CategoricalEncoder(categorical_threshold=0.05)),
+            ('dropper', ColumnDropper(MISSING_THRESHOLD, VARIANCE_THRESHOLD)),
+            ('imputer', AdvancedImputer(max_iter=10, random_state=RANDOM_STATE)),
+            ('scaler', StandardScaler()),
+            ('model', lgb.LGBMClassifier(**lgbm_params))
+        ])
+        print("   ✓ LightGBM pipeline created")
+    else:
+        print("   ⚠️  LightGBM not available - skipping")
     
-    print(f"✅ Created {len(models)} model pipeline variations")
-    model_counts = {}
-    for model_name in models.keys():
-        base_name = model_name.split('-')[0]
-        model_counts[base_name] = model_counts.get(base_name, 0) + 1
+    if not models:
+        raise RuntimeError("No models available! Install xgboost and/or lightgbm: pip install xgboost lightgbm")
     
-    count_str = ', '.join([f'{k}: {v}' for k, v in model_counts.items()])
-    print(f"   Configs per model: {count_str}")
-    
+    print(f"✅ Created {len(models)} optimized model pipeline(s)")
     return models
 
 
@@ -1003,17 +1068,48 @@ def extract_feature_importances(X_raw, y, feature_names, best_model_pipeline):
     # Get the trained model from the pipeline
     trained_model = best_model_pipeline.named_steps['model']
     
-    # Get feature names after column dropping
+    # Get feature names after column dropping and categorical encoding
+    # Need to trace through the pipeline to get correct feature names
+    categorical_encoder = best_model_pipeline.named_steps.get('categorical')
     dropper = best_model_pipeline.named_steps['dropper']
-    kept_features = dropper.cols_to_keep_
+    imputer = best_model_pipeline.named_steps['imputer']
+    
+    # Start with original features
+    if categorical_encoder:
+        current_features = categorical_encoder.feature_names_
+    else:
+        current_features = feature_names
+    
+    # After dropper
+    if dropper and dropper.cols_to_keep_:
+        kept_features = dropper.cols_to_keep_
+    else:
+        kept_features = current_features
+    
+    # After imputer (which adds missingness indicators)
+    if hasattr(imputer, 'n_features_out_') and imputer.n_features_out_:
+        n_original = len(kept_features)
+        n_total = imputer.n_features_out_
+        n_indicators = n_total - n_original
+        
+        # Extend feature names with missingness indicators
+        final_features = list(kept_features) + [f"{feat}_missing" for feat in kept_features[:n_indicators]]
+    else:
+        final_features = kept_features
     
     # Extract feature importances if available
     if hasattr(trained_model, 'feature_importances_'):
         importances = trained_model.feature_importances_
         
+        # Ensure dimensions match
+        if len(importances) != len(final_features):
+            print(f"⚠️ Dimension mismatch: {len(importances)} importances vs {len(final_features)} features")
+            print(f"   Using first {len(importances)} features")
+            final_features = final_features[:len(importances)]
+        
         # Create DataFrame
         importance_df = pd.DataFrame({
-            'feature': kept_features,
+            'feature': final_features,
             'importance': importances
         }).sort_values('importance', ascending=False)
         
@@ -1025,6 +1121,49 @@ def extract_feature_importances(X_raw, y, feature_names, best_model_pipeline):
     else:
         print(f"\n⚠️ Model does not provide feature importances")
         return None
+
+
+def save_importances_incrementally(importance_df, diagnosis_code, model_name, performance_metrics, output_file='final_importances.csv'):
+    """
+    Incrementally save feature importances to CSV file.
+    Appends new importances after each successful diagnosis evaluation.
+    
+    Args:
+        importance_df: DataFrame with 'feature' and 'importance' columns
+        diagnosis_code: ICD code
+        model_name: Name of the model
+        performance_metrics: Dict with 'F1', 'Accuracy', 'ROC_AUC', etc.
+        output_file: Path to output CSV file
+    """
+    if importance_df is None or importance_df.empty:
+        return
+    
+    # Create records to save
+    records = []
+    for _, row in importance_df.iterrows():
+        record = {
+            'diagnosis_code': diagnosis_code,
+            'model': model_name,
+            'feature': row['feature'],
+            'importance': row['importance'],
+            'f1_score': performance_metrics.get('F1', None),
+            'accuracy': performance_metrics.get('Accuracy', None),
+            'roc_auc': performance_metrics.get('ROC_AUC', None),
+            'overfit_gap': performance_metrics.get('Overfit_Gap', None)
+        }
+        records.append(record)
+    
+    new_df = pd.DataFrame(records)
+    
+    # Append to existing file or create new one
+    if os.path.exists(output_file):
+        # Append without header
+        new_df.to_csv(output_file, mode='a', header=False, index=False)
+        print(f"   📝 Appended {len(records)} importance records to {output_file}")
+    else:
+        # Create new file with header
+        new_df.to_csv(output_file, mode='w', header=True, index=False)
+        print(f"   📝 Created {output_file} with {len(records)} importance records")
 
 
 def plot_feature_importances(importance_df, top_n=20, filename='feature_importances.png'):
@@ -3297,9 +3436,16 @@ def create_final_report_visualizations(top20_df, top50_df, top100_df, output_fol
 
 def main():
     print("\n" + "=" * 70)
-    print("INDIVIDUAL DIAGNOSIS PREDICTION FROM SDoH FEATURES")
-    print("Leakage-Free Analysis with Comparative Study")
+    print("ALL ICD CODES PREDICTION FROM SDoH FEATURES")
+    print("Streamlined Analysis with Balanced Sampling")
+    print("Performance Threshold: 70% (F1, Accuracy, or ROC-AUC)")
     print("=" * 70)
+    
+    # Initialize or clear the output file
+    output_file = 'final_importances.csv'
+    if os.path.exists(output_file):
+        print(f"\n⚠️  Removing existing {output_file}")
+        os.remove(output_file)
     
     # Step 1: Load and link datasets
     acxiom_df, diagnosis_df, common_ids = load_and_link_datasets(ACXIOM_PATH, DIAGNOSIS_PATH)
@@ -3307,193 +3453,149 @@ def main():
     # Step 2: Extract diagnoses
     patient_diagnoses, diagnosis_prevalence = extract_diagnosis_codes(diagnosis_df)
     
-    # Step 3: Validate target diagnoses
+    # Step 3: Get ALL diagnoses for testing (minimum 50 samples)
     total_patients = len(patient_diagnoses)
-    valid_diagnoses = validate_target_diagnoses(diagnosis_prevalence, TARGET_DIAGNOSES, total_patients)
+    all_diagnoses = get_all_diagnoses_for_testing(diagnosis_prevalence, total_patients, min_samples=50)
     
-    if len(valid_diagnoses) == 0:
-        print("\n❌ No valid diagnoses found!")
+    if len(all_diagnoses) == 0:
+        print("\n❌ No diagnoses found!")
         return
     
     # Step 4: Prepare features
-    X_raw, feature_names = prepare_features(acxiom_df)
+    X_raw_full, feature_names = prepare_features(acxiom_df)
     
     # Align X_raw with patient_diagnoses
-    X_raw['patient_id'] = acxiom_df['patient_id']
-    X_raw = X_raw.set_index('patient_id')
+    X_raw_full['patient_id'] = acxiom_df['patient_id']
+    X_raw_full = X_raw_full.set_index('patient_id')
     
-    # Step 5: Create models with hyperparameter variations
+    # Step 5: Create optimized model pipelines (XGBoost + LightGBM only)
     print("\n" + "=" * 70)
-    print("Step 5: Creating Leakage-Free Model Pipelines with Variations")
+    print("Step 5: Creating Optimized Leakage-Free Model Pipelines")
     print("=" * 70)
     models = create_model_pipelines()
     
-    # Step 6: Evaluate each diagnosis
+    # Step 6: Evaluate ALL diagnoses with balanced sampling
     print("\n" + "=" * 70)
-    print(f"Step 6: Evaluating {len(valid_diagnoses)} Individual Diagnoses")
+    print(f"Step 6: Evaluating {len(all_diagnoses)} Diagnosis Codes")
     print("=" * 70)
     
-    all_results = []
-    all_refined_results = []
-    all_feature_importances = []  # Track feature importances across all runs
+    successful_saves = 0
+    skipped_low_performance = 0
+    skipped_errors = 0
     
-    for i, dx_info in enumerate(valid_diagnoses, 1):
+    for i, dx_info in enumerate(all_diagnoses, 1):
         dx_code = dx_info['code']
-        dx_safe = dx_code.replace('.', '_')  # Safe folder name
-        viz_folder = f"{BASE_VIZ_FOLDER}/visualisations_{dx_safe}"
         
         print(f"\n{'='*70}")
-        print(f"🔬 Analyzing Diagnosis {i}/{len(valid_diagnoses)}: {dx_code}")
+        print(f"🔬 [{i}/{len(all_diagnoses)}] Testing: {dx_code}")
+        print(f"   Total patients with diagnosis: {dx_info['count']} ({dx_info['prevalence']*100:.1f}%)")
         print(f"{'='*70}")
-        print(f"Patients: {dx_info['count']} ({dx_info['prevalence']*100:.1f}%)")
         
-        # Create labels
-        y = create_labels_for_diagnosis(X_raw.index, patient_diagnoses, dx_code)
-        y = y.reindex(X_raw.index, fill_value=0)
-        
-        print(f"\nLabel distribution:")
-        print(f"  Positive (has {dx_code}): {(y==1).sum()} ({(y==1).mean()*100:.1f}%)")
-        print(f"  Negative (no {dx_code}): {(y==0).sum()} ({(y==0).mean()*100:.1f}%)")
-        
-        # Skip if too imbalanced
-        prevalence = (y==1).mean()
-        if prevalence < 0.05 or prevalence > 0.95:
-            print(f"\n⚠️ Skipping {dx_code}: Too imbalanced ({prevalence*100:.1f}%)")
-            continue
-        
-        # Evaluate
-        results_df = evaluate_diagnosis(X_raw, y, dx_code, models)
-        all_results.append(results_df)
-        
-        # Print summary
-        if not results_df.empty:
-            # Sort by COMPOSITE SCORE (balances F1 and generalization)
+        try:
+            # Create BALANCED labels using sampling
+            y, selected_patient_ids = create_balanced_labels_for_diagnosis(
+                X_raw_full.index.tolist(), patient_diagnoses, dx_code, random_state=RANDOM_STATE
+            )
+            
+            if y is None or selected_patient_ids is None:
+                print(f"   ⚠️ Skipping {dx_code}: No positive samples")
+                skipped_errors += 1
+                continue
+            
+            # Subset X_raw to selected patients only (balanced sample)
+            X_raw = X_raw_full.loc[selected_patient_ids]
+            y = y.reindex(selected_patient_ids)
+            
+            print(f"   📊 Balanced dataset created:")
+            print(f"      Positives: {(y==1).sum()} | Negatives: {(y==0).sum()} | Total: {len(y)}")
+            
+            # Check if we have enough samples
+            if len(y) < 50:
+                print(f"   ⚠️ Skipping {dx_code}: Insufficient samples ({len(y)} < 50)")
+                skipped_errors += 1
+                continue
+            
+            # Evaluate with CV
+            results_df = evaluate_diagnosis(X_raw, y, dx_code, models)
+            
+            if results_df.empty:
+                print(f"   ⚠️ No models passed quality checks for {dx_code}")
+                skipped_errors += 1
+                continue
+            
+            # Get best model by Composite Score
             best = results_df.sort_values('Composite_Score', ascending=False).iloc[0]
-            print(f"\n✅ Best model (by composite score): {best['Model']}")
-            print(f"   F1: {best['F1']:.3f}, ROC-AUC: {best['ROC_AUC']:.3f}, Gap: {best['Overfit_Gap']:.3f}")
-            print(f"   Composite Score: {best['Composite_Score']:.3f} (F1 × generalization penalty)")
             
-            # Show comparison with pure F1 selection
-            best_f1 = results_df.sort_values('F1', ascending=False).iloc[0]
-            if best_f1['Model'] != best['Model']:
-                print(f"\n   ℹ️  Note: Pure F1 would select {best_f1['Model']} (F1={best_f1['F1']:.3f}, Gap={best_f1['Overfit_Gap']:.3f})")
-                print(f"   But composite score prefers {best['Model']} for better generalization")
+            print(f"\n   ✅ Best model: {best['Model']}")
+            print(f"      F1: {best['F1']:.3f} | Accuracy: {best['Accuracy']:.3f} | ROC-AUC: {best['ROC_AUC']:.3f}")
+            print(f"      Overfit Gap: {best['Overfit_Gap']:.3f}")
             
-            # Create visualizations comparing all models and highlighting best
-            Path(viz_folder).mkdir(parents=True, exist_ok=True)
-            create_model_comparison_for_diagnosis(results_df, dx_code, viz_folder)
-            create_best_model_summary(results_df, dx_code, viz_folder)
+            # Check performance threshold: 70% on any of F1, Accuracy, or ROC-AUC
+            passes_threshold = (
+                best['F1'] >= 0.70 or 
+                best['Accuracy'] >= 0.70 or 
+                best['ROC_AUC'] >= 0.70
+            )
             
-            # Step 7: Feature importance and refined analysis for this diagnosis
-            best_model_name = best['Model']
-            best_pipeline = models[best_model_name]
-            
-            # Extract feature importances
-            importance_df = extract_feature_importances(X_raw, y, X_raw.columns.tolist(), best_pipeline)
-            
-            # Store for cross-diagnosis analysis
-            all_feature_importances.append({
-                'diagnosis': dx_code,
-                'importance_df': importance_df
-            })
-            
-            if importance_df is not None:
-                # Save visualizations for this diagnosis
-                Path(viz_folder).mkdir(parents=True, exist_ok=True)
+            if passes_threshold:
+                print(f"      🎯 PERFORMANCE ≥70%! Extracting and saving importances...")
                 
-                plot_feature_importances(importance_df, top_n=30, 
-                                        filename=f'{viz_folder}/initial_feature_importances.png')
-                plot_correlation_heatmap(X_raw, y, importance_df, top_n=20,
-                                        filename=f'{viz_folder}/initial_correlation_heatmap.png')
+                # Get best pipeline and extract importances
+                best_model_name = best['Model']
+                best_pipeline = models[best_model_name]
                 
-                # Refined analysis with top 20 features
-                refined_results, refined_pipeline, X_refined, y_pred, y_pred_proba, top_features = \
-                    refined_analysis_top_features(
-                        X_raw, y, importance_df, best_model_name, 
-                        top_n_features=20, diagnosis_code=dx_code
+                importance_df = extract_feature_importances(X_raw, y, X_raw.columns.tolist(), best_pipeline)
+                
+                if importance_df is not None and not importance_df.empty:
+                    # Prepare performance metrics
+                    perf_metrics = {
+                        'F1': best['F1'],
+                        'Accuracy': best['Accuracy'],
+                        'ROC_AUC': best['ROC_AUC'],
+                        'Overfit_Gap': best['Overfit_Gap']
+                    }
+                    
+                    # Save incrementally
+                    save_importances_incrementally(
+                        importance_df, dx_code, best_model_name, 
+                        perf_metrics, output_file=output_file
                     )
-                
-                # Advanced feature analysis (NEW!)
-                quality_df = create_advanced_feature_analysis_report(
-                    X_raw, y, importance_df, best_pipeline, 
-                    dx_code, viz_folder, top_n=20
-                )
-                
-                # Create advanced visualizations
-                create_advanced_visualizations(
-                    X_refined, y, y_pred, y_pred_proba, 
-                    top_features, refined_pipeline, viz_folder
-                )
-                
-                # Save refined results
-                refined_df = pd.DataFrame([refined_results])
-                refined_df.to_csv(f'{viz_folder}/refined_model_results.csv', index=False)
-                all_refined_results.append(refined_results)
-                
-                print(f"\n✅ Saved all visualizations to: {viz_folder}/")
+                    
+                    successful_saves += 1
+                else:
+                    print(f"      ⚠️ Could not extract importances")
+                    skipped_errors += 1
+            else:
+                print(f"      ❌ Performance <70% - NOT saving importances")
+                skipped_low_performance += 1
+        
+        except Exception as e:
+            print(f"   ❌ ERROR processing {dx_code}: {str(e)}")
+            skipped_errors += 1
+            continue
     
-    # Combine all results
-    if len(all_results) > 0:
-        final_results = pd.concat(all_results, ignore_index=True)
-        final_results.to_csv(OUTPUT_PATH, index=False)
-        print(f"\n✅ Saved all results to: {OUTPUT_PATH}")
-        
-        # Step 8: Comparative Analysis
-        print("\n" + "=" * 70)
-        print("Step 8: COMPARATIVE ANALYSIS")
-        print("=" * 70)
-        
-        create_comparative_analysis(final_results, all_refined_results, all_feature_importances)
-        
-        # Step 9: Cross-Diagnosis Feature Aggregation & Final Report
-        print("\n" + "=" * 70)
-        print("Step 9: CROSS-DIAGNOSIS FEATURE AGGREGATION")
-        print("=" * 70)
-        
-        create_final_feature_report(all_feature_importances)
-        
-        # Final Summary
-        print("\n" + "=" * 70)
-        print("✅ COMPLETE ANALYSIS FINISHED")
-        print("=" * 70)
-        print(f"\n📁 Output Structure:")
-        print(f"\n   Main Results:")
-        print(f"   - {OUTPUT_PATH}")
-        print(f"\n   Individual Diagnosis Folders: {BASE_VIZ_FOLDER}/")
-        print(f"   - visualisations_I10/")
-        print(f"   - visualisations_E78_5/")
-        print(f"   - ... (one folder per diagnosis)")
-        print(f"\n   Comparative Analysis: {COMPARATIVE_FOLDER}/")
-        print(f"   - 0_feature_importance_analysis.png (NEW! Top 20 features)")
-        print(f"   - feature_importance_summary.csv (NEW! All features with stats)")
-        print(f"   - 1_performance_comparison.png")
-        print(f"   - 2_refined_comparison.png")
-        print(f"   - summary_statistics.csv")
-        print(f"\n   Each diagnosis folder contains:")
-        print(f"   - 0_all_models_comparison.png")
-        print(f"   - 0_best_model_summary.png")
-        print(f"   - initial_feature_importances.png")
-        print(f"   - initial_correlation_heatmap.png")
-        print(f"   - 1_refined_feature_importance.png")
-        print(f"   - 2_prediction_analysis.png")
-        print(f"   - 3_feature_distributions.png")
-        print(f"   - 4_calibration_analysis.png")
-        print(f"   - 5_performance_curves.png")
-        print(f"   - 6_feature_quality_dashboard.png (NEW! Advanced metrics)")
-        print(f"   - 7_feature_distributions.png (NEW! Class separation)")
-        print(f"   - 8_executive_summary.png (NEW! Presentation-ready)")
-        print(f"   - feature_analysis_complete.csv (NEW! All quality metrics)")
-        print(f"   - refined_model_results.csv")
-        
-        print("\n" + "=" * 70)
-        print(f"✨ Analyzed {len(valid_diagnoses)} diagnoses")
-        print(f"✨ Created {len(valid_diagnoses)} individual visualization folders")
-        print(f"✨ Generated comparative analysis across all diagnoses")
-        print("=" * 70)
-    else:
-        print("\n❌ No diagnoses were successfully analyzed!")
-    
+    # Final summary
     print("\n" + "=" * 70)
+    print("🎉 ANALYSIS COMPLETE!")
+    print("=" * 70)
+    print(f"Total diagnoses tested: {len(all_diagnoses)}")
+    print(f"✅ Successfully saved importances: {successful_saves}")
+    print(f"❌ Below 70% threshold: {skipped_low_performance}")
+    print(f"⚠️  Errors/skipped: {skipped_errors}")
+    
+    if os.path.exists(output_file):
+        saved_df = pd.read_csv(output_file)
+        unique_diagnoses = saved_df['diagnosis_code'].nunique()
+        total_records = len(saved_df)
+        print(f"\n📁 Final output: {output_file}")
+        print(f"   Unique diagnoses: {unique_diagnoses}")
+        print(f"   Total importance records: {total_records}")
+    else:
+        print(f"\n⚠️  No importances were saved (no models passed 70% threshold)")
+
+
+if __name__ == '__main__':
+    main()
 
 
 if __name__ == "__main__":
