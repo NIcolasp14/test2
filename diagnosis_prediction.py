@@ -397,13 +397,15 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
     print(f"\nLoading Acxiom data from {acxiom_path}...")
     acxiom = pd.read_csv(acxiom_path, low_memory=False, dtype=str)
     print(f"  Shape: {acxiom.shape}")
-    print(f"  Columns (first 10): {list(acxiom.columns[:10])}")
+    print(f"  Total columns: {len(acxiom.columns)}")
+    print(f"  ALL columns: {list(acxiom.columns)}")
     
     # Load Diagnosis
     print(f"\nLoading Diagnosis data from {diagnosis_path}...")
     diagnosis = pd.read_csv(diagnosis_path, low_memory=False, dtype=str)
     print(f"  Shape: {diagnosis.shape}")
-    print(f"  Columns (first 10): {list(diagnosis.columns[:10])}")
+    print(f"  Total columns: {len(diagnosis.columns)}")
+    print(f"  ALL columns: {list(diagnosis.columns)}")
     
     # Find best candidate ID columns by matching likely ID-like column names.
     # Prefer real member ID columns and explicitly avoid zipcode-like columns.
@@ -425,6 +427,10 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
         acx_candidates = [c for c in acxiom.columns if 'id' in c.lower() and not any(z in c.lower() for z in zip_tokens)]
     if len(diag_candidates) == 0:
         diag_candidates = [c for c in diagnosis.columns if 'id' in c.lower() and not any(z in c.lower() for z in zip_tokens)]
+    
+    print(f"\n🔎 All potential ID columns found:")
+    print(f"   Acxiom candidates: {acx_candidates}")
+    print(f"   Diagnosis candidates: {diag_candidates}")
 
     # Score candidate pairs by overlap and pick the best pair
     best_pair = (None, None)
@@ -437,6 +443,10 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
         except Exception:
             return set()
 
+    print(f"\n🔬 Testing overlap for all ID column pairs:")
+    print(f"   {'Acxiom Column':<30} {'Diagnosis Column':<30} {'Overlap':<10} {'Acx Uniq':<10} {'Diag Uniq'}")
+    print(f"   {'-'*30} {'-'*30} {'-'*10} {'-'*10} {'-'*10}")
+    
     for a_col in acx_candidates:
         a_vals = values_set(acxiom, a_col)
         if len(a_vals) == 0:
@@ -444,9 +454,20 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
         for d_col in diag_candidates:
             d_vals = values_set(diagnosis, d_col)
             overlap = len(a_vals.intersection(d_vals))
+            
+            # Print each pair's overlap
+            print(f"   {a_col:<30} {d_col:<30} {overlap:<10,} {len(a_vals):<10,} {len(d_vals):,}")
+            
+            # Show sample values if overlap is 0
+            if overlap == 0:
+                print(f"      📋 Sample values from {a_col}: {list(a_vals)[:3]}")
+                print(f"      📋 Sample values from {d_col}: {list(d_vals)[:3]}")
+            
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_pair = (a_col, d_col)
+    
+    print(f"\n   ✅ Best pair selected: {best_pair[0]} <-> {best_pair[1]} (overlap: {best_overlap:,})")
 
     # If best_pair looks like a zipcode (values are 5-digit numeric strings), deprioritize
     def looks_like_zip(df, col):
@@ -509,6 +530,18 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
     acxiom[acx_id_col] = acxiom[acx_id_col].astype(str).str.strip()
     diagnosis[diag_id_col] = diagnosis[diag_id_col].astype(str).str.strip()
     
+    # Show sample IDs for debugging
+    print(f"\n🔍 Sample IDs for format inspection:")
+    print(f"   Acxiom ({acx_id_col}) - first 5 non-null values:")
+    acx_sample = acxiom[acx_id_col].dropna().head(5).tolist()
+    for idx, val in enumerate(acx_sample, 1):
+        print(f"      {idx}. {val}")
+    
+    print(f"\n   Diagnosis ({diag_id_col}) - first 5 non-null values:")
+    diag_sample = diagnosis[diag_id_col].dropna().head(5).tolist()
+    for idx, val in enumerate(diag_sample, 1):
+        print(f"      {idx}. {val}")
+    
     # Find common patients
     acx_ids = set(acxiom[acx_id_col].unique())
     diag_ids = set(diagnosis[diag_id_col].unique())
@@ -527,49 +560,140 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
     # diagnosis-side IDs to Acxiom `member_id`. The bridge file is typically
     # `diagnosis_with_acxiom.csv` and we write/read `id_bridge.csv`.
     if len(common_ids) == 0:
-        print("\nNo direct patient ID overlap found — attempting to build/use ID bridge...")
+        print("\n" + "="*70)
+        print("⚠️ NO DIRECT OVERLAP - ATTEMPTING BRIDGE FILE LINKING")
+        print("="*70)
+        print("\n🔗 Bridge file strategy:")
+        print("   1. Try loading existing 'id_bridge.csv'")
+        print("   2. Try creating from 'diagnosis_with_acxiom.csv'")
+        print("   3. Try creating from 'demographics.csv'")
+        
         bridge = None
+        
+        # Attempt 1: Existing bridge
+        print(f"\n📂 Attempt 1: Loading existing id_bridge.csv...")
         try:
-            # Prefer an existing id_bridge.csv if present
             bridge = pd.read_csv('id_bridge.csv', dtype=str)
-            print(f"   Loaded existing id_bridge.csv (rows: {len(bridge)})")
-        except Exception:
-            bridge = create_bridge_from_diagnosis_with_acxiom('diagnosis_with_acxiom.csv', out_path='id_bridge.csv')
+            print(f"   ✅ SUCCESS! Loaded existing id_bridge.csv")
+            print(f"      Rows: {len(bridge)}")
+            print(f"      Columns: {list(bridge.columns)}")
+            print(f"      Sample rows (first 3):")
+            print(bridge.head(3).to_string(index=False))
+        except FileNotFoundError:
+            print(f"   ❌ File not found: id_bridge.csv")
+        except Exception as e:
+            print(f"   ❌ Error loading id_bridge.csv: {e}")
+        
+        # Attempt 2: diagnosis_with_acxiom.csv
+        if bridge is None or bridge.empty:
+            print(f"\n📂 Attempt 2: Creating from diagnosis_with_acxiom.csv...")
+            try:
+                bridge = create_bridge_from_diagnosis_with_acxiom('diagnosis_with_acxiom.csv', out_path='id_bridge.csv')
+                if bridge is not None and not bridge.empty:
+                    print(f"   ✅ SUCCESS! Created bridge from diagnosis_with_acxiom.csv")
+                    print(f"      Rows: {len(bridge)}")
+                else:
+                    print(f"   ❌ Bridge creation returned empty or None")
+            except FileNotFoundError:
+                print(f"   ❌ File not found: diagnosis_with_acxiom.csv")
+            except Exception as e:
+                print(f"   ❌ Error: {e}")
 
-        # If diagnosis_with_acxiom didn't produce a bridge, try demographics + acxiom mapping
+        # Attempt 3: demographics.csv
         if (bridge is None or bridge.empty):
+            print(f"\n📂 Attempt 3: Creating from demographics.csv...")
             try:
                 bridge = create_bridge_via_demographics(acxiom, demographics_path='demographics.csv', out_path='id_bridge.csv')
+                if bridge is not None and not bridge.empty:
+                    print(f"   ✅ SUCCESS! Created bridge from demographics.csv")
+                    print(f"      Rows: {len(bridge)}")
+                else:
+                    print(f"   ❌ Bridge creation returned empty or None")
+            except FileNotFoundError:
+                print(f"   ❌ File not found: demographics.csv")
             except Exception as e:
-                print(f"   demographics-based bridge failed: {e}")
+                print(f"   ❌ Error: {e}")
 
+        # Apply bridge if available
         if bridge is not None and not bridge.empty:
+            print(f"\n🔗 Applying bridge to link datasets...")
+            print(f"   Bridge columns: {list(bridge.columns)}")
+            
+            # Identify bridge columns (flexible naming)
+            diag_bridge_col = None
+            member_bridge_col = None
+            
+            for col in bridge.columns:
+                if 'diag' in col.lower() or 'sys' in col.lower() or 'clm' in col.lower():
+                    diag_bridge_col = col
+                if 'member' in col.lower() or 'acx' in col.lower():
+                    member_bridge_col = col
+            
+            if not diag_bridge_col:
+                diag_bridge_col = bridge.columns[0]
+            if not member_bridge_col:
+                member_bridge_col = bridge.columns[1] if len(bridge.columns) > 1 else bridge.columns[0]
+            
+            print(f"   Using bridge columns: {diag_bridge_col} -> {member_bridge_col}")
+            
             # Build mapping diag_id -> member_id
-            bridge_map = dict(zip(bridge['diag_id'].astype(str).str.strip(), bridge['member_id'].astype(str).str.strip()))
+            bridge_map = dict(zip(
+                bridge[diag_bridge_col].astype(str).str.strip(), 
+                bridge[member_bridge_col].astype(str).str.strip()
+            ))
+            
+            print(f"   Bridge mapping created: {len(bridge_map):,} unique mappings")
+            print(f"   Sample mappings (first 3):")
+            for i, (k, v) in enumerate(list(bridge_map.items())[:3]):
+                print(f"      {k} -> {v}")
 
             # Map diagnosis IDs to member_id
             diagnosis['mapped_member_id'] = diagnosis[diag_id_col].astype(str).str.strip().map(bridge_map)
+            mapped_count = diagnosis['mapped_member_id'].notna().sum()
+            print(f"\n   Mapped {mapped_count:,} diagnosis records to member_ids")
+            
             mapped_ids = set(diagnosis['mapped_member_id'].dropna().unique())
+            print(f"   Unique mapped IDs: {len(mapped_ids):,}")
 
             # Prefer Acxiom member_id column if present
             if 'member_id' in acxiom.columns:
                 acx_id_col = 'member_id'
+                print(f"   Using Acxiom column: {acx_id_col}")
 
             acx_ids = set(acxiom[acx_id_col].astype(str).str.strip().unique())
             common_ids = acx_ids.intersection(mapped_ids)
 
-            print(f"   Bridge-enabled overlap: {len(common_ids)} patients")
+            print(f"\n   🎯 Bridge-enabled overlap: {len(common_ids):,} patients ({len(common_ids)/len(acx_ids)*100:.1f}% of Acxiom)")
+            
             if len(common_ids) == 0:
-                print("   Bridge found but no matching member_ids in Acxiom — bridge may use different formats.")
+                print(f"\n   ❌ WARNING: Bridge found but no matching IDs!")
+                print(f"      Sample Acxiom IDs: {list(acx_ids)[:5]}")
+                print(f"      Sample mapped IDs: {list(mapped_ids)[:5]}")
         else:
-            print("   No usable bridge available.")
+            print("\n   ❌ No usable bridge file found")
+            print("\n💡 SOLUTIONS:")
+            print("   1. Create 'id_bridge.csv' with columns mapping diagnosis IDs to member IDs")
+            print("   2. Provide 'demographics.csv' with ID mappings")
+            print("   3. Or provide 'diagnosis_with_acxiom.csv' containing both ID types")
+    print("\n" + "="*70)
+    print("📊 FINAL FILTERING TO COMMON PATIENTS")
+    print("="*70)
+    
     # Filter to common patients
+    print(f"\nFiltering datasets to {len(common_ids):,} common patients...")
     acxiom_filtered = acxiom[acxiom[acx_id_col].astype(str).str.strip().isin(common_ids)].copy()
+    
     # If we created a mapped_member_id via bridge use it for filtering
     if 'mapped_member_id' in diagnosis.columns:
         diagnosis_filtered = diagnosis[diagnosis['mapped_member_id'].astype(str).str.strip().isin(common_ids)].copy()
+        print(f"   Using mapped_member_id for diagnosis filtering")
     else:
         diagnosis_filtered = diagnosis[diagnosis[diag_id_col].astype(str).str.strip().isin(common_ids)].copy()
+        print(f"   Using {diag_id_col} for diagnosis filtering")
+    
+    print(f"\nFiltered results:")
+    print(f"   Acxiom: {len(acxiom)} -> {len(acxiom_filtered)} rows")
+    print(f"   Diagnosis: {len(diagnosis)} -> {len(diagnosis_filtered)} rows")
     
     # Rename ID columns to standard name
     acxiom_filtered = acxiom_filtered.rename(columns={acx_id_col: 'patient_id'})
@@ -578,6 +702,10 @@ def load_and_link_datasets(acxiom_path, diagnosis_path):
         diagnosis_filtered = diagnosis_filtered.rename(columns={'mapped_member_id': 'patient_id'})
     else:
         diagnosis_filtered = diagnosis_filtered.rename(columns={diag_id_col: 'patient_id'})
+    
+    print(f"\n✅ Datasets linked successfully!")
+    print(f"   Standardized ID column: 'patient_id'")
+    print(f"   Ready for analysis with {len(common_ids):,} patients")
     
     return acxiom_filtered, diagnosis_filtered, list(common_ids)
 
@@ -671,21 +799,7 @@ def get_all_diagnoses_for_testing(diagnosis_prevalence, total_patients, min_samp
     print("=" * 70)
     
     all_diagnoses = []
-    
-    print(f"\nFiltering diagnoses with at least {min_samples} samples...")
-    
-    for dx_code, count in diagnosis_prevalence.items():
-        if count >= min_samples:
-            prevalence = count / total_patients
-            all_diagnoses.append({
-                'code': dx_code,
-                'count': count,
-                'prevalence': prevalence
-            })
-    
-    # Sort by prevalence (most common first)
-    all_diagnoses = sorted(all_diagnoses, key=lambda x: x['count'], reverse=True)
-    
+
     print(f"\n✅ Found {len(all_diagnoses)} diagnoses with ≥{min_samples} samples")
     print(f"\n📊 Top 20 most common diagnoses:")
     for dx_info in all_diagnoses[:20]:
@@ -695,12 +809,6 @@ def get_all_diagnoses_for_testing(diagnosis_prevalence, total_patients, min_samp
         print(f"\n⚠️ WARNING: No diagnoses found with ≥{min_samples} samples!")
     
     return all_diagnoses
-        print("\n⚠️ WARNING: No target diagnoses found!")
-        print("Available diagnosis codes (top 20):")
-        for dx, count in diagnosis_prevalence.head(20).items():
-            print(f"   {dx}: {count} patients")
-    
-    return valid_diagnoses
 
 
 # =============================================================================
