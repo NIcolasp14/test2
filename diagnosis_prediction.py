@@ -799,6 +799,20 @@ def get_all_diagnoses_for_testing(diagnosis_prevalence, total_patients, min_samp
     print("=" * 70)
     
     all_diagnoses = []
+    
+    print(f"\nFiltering diagnoses with at least {min_samples} samples...")
+    
+    for dx_code, count in diagnosis_prevalence.items():
+        if count >= min_samples:
+            prevalence = count / total_patients
+            all_diagnoses.append({
+                'code': dx_code,
+                'count': count,
+                'prevalence': prevalence
+            })
+    
+    # Sort by prevalence (most common first)
+    all_diagnoses = sorted(all_diagnoses, key=lambda x: x['count'], reverse=True)
 
     print(f"\n✅ Found {len(all_diagnoses)} diagnoses with ≥{min_samples} samples")
     print(f"\n📊 Top 20 most common diagnoses:")
